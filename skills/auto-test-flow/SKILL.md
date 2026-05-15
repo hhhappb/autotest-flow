@@ -15,6 +15,20 @@ Use this skill to act as a senior QA automation engineer. Take a rough testing r
 - Use existing project conventions first: test framework, file layout, fixtures, page objects, naming, scripts, environment variables, and assertion style.
 - Do not introduce a new test framework if the repo already has a suitable one.
 - Do not run destructive tests against production data. If environment safety is unclear, ask before executing state-changing flows.
+- When project rules require confirmation before code changes, list the files, change points, and reasons first, then wait for the user's confirmation.
+
+## Project-Specific Context
+
+Keep `SKILL.md` general. Load project-specific references only when the target repository matches their signals.
+
+For Python/Pytest hybrid UI automation projects, read `references/hybrid-ui-automation-project-guide.md` when the repository has signals such as:
+
+- `pytest.ini`, `runner.py`, or `requirements/requirements.txt`
+- `core/base/`, `core/drivers/`, or Electron/desktop driver helpers
+- `project/<module>/pages/`, `project/<module>/selectors/`, or `project/<module>/testcases/`
+- Playwright, Pywinauto, Pytest, or Allure usage in existing files
+
+Use that reference as sanitized project-family guidance. Do not copy private links, real IPs, credentials, account data, production settings, or company-internal details into generated artifacts.
 
 ## Recommended Companion Skills
 
@@ -50,6 +64,7 @@ Before writing test code, inspect the repository:
 - Read nearby existing tests and helper utilities before adding new patterns.
 - Identify how tests are run: `npm test`, `npm run test:e2e`, `npx playwright test`, `pytest`, Maven/Gradle, or repo-specific scripts.
 - Check whether dependencies are already installed. Ask before installing new dependencies unless the user has clearly requested setup.
+- If the repository matches the Python/Pytest hybrid UI automation signals, read `references/hybrid-ui-automation-project-guide.md` before proposing file changes.
 
 Use `references/framework-guidance.md` to choose the implementation style.
 
