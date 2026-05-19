@@ -1,13 +1,15 @@
 # auto-test-flow
 
-版本：`v0.3.0`
+版本：`v0.3.1`
 
 [English README](README.md)
 
 `auto-test-flow` 是一个用于 QA 自动化流程的 agent skill。它可以把粗略测试需求转换成增强后的需求、结构化测试方案、测试用例、自动化实现请求，以及可交给 Codex 的代码落地任务。
 
-当前版本重点是 **Phase 2.6 pipeline**：
+当前版本重点是 **双模式 QA 工作流**：
 
+- Inline 模式用于在对话中快速产出需求分析、测试设计和实现计划草稿。
+- Pipeline 模式用于把同一套流程落盘成可审计的 Markdown 和 JSON 产物。
 - DeepSeek v4-pro 负责需求分析和结构化测试产物。
 - review policy gate 在交给 Codex 前审查生成结果。
 - Codex/GPT-5.5 接收专门的 handoff 任务包，负责项目发现、代码修改计划、测试实现、执行与修复。
@@ -23,6 +25,54 @@
 - 通过 `auto-review`、`ask`、`full-auto` 三种策略审查产物。
 - 生成 Codex handoff 产物，用于后续测试代码落地。
 - 保留明确的用户确认 gate，避免未经确认修改项目代码。
+
+## Inline 与 Pipeline
+
+`auto-test-flow` 有两种模式。Inline 是 Pipeline 的轻量草稿版。Inline 不代表可以跳过需求分析或测试用例设计，只是把产物直接输出在对话里，而不是写入文件。
+
+| 模式 | 适合场景 | 输出形式 | 门禁 |
+|---|---|---|---|
+| Inline | 快速探索、早期需求澄清、快速测试设计 | 对话输出：增强需求、假设、测试范围、测试点、用例表、实现计划、待确认问题 | 修改代码前仍需用户确认 |
+| Pipeline | 正式评审、复用产物、审计留痕、多人交接 | 文件输出：`boosted_requirement.md`、`test_plan.md`、`test_cases.md`、JSON 产物、review notes、Codex handoff 包 | review policy gate + 修改代码前用户确认 |
+
+Inline 最少应该输出：
+
+1. 增强后的测试需求
+2. 假设和待确认问题
+3. 测试范围
+4. 测试点拆解
+5. 带优先级的测试用例表
+6. 自动化实现计划
+7. 如果涉及代码实现，列出拟修改文件、修改原因和验证命令
+
+Pipeline 会把同一套概念流程持久化：
+
+```text
+原始需求
+  -> 增强需求
+  -> 结构化字段
+  -> 测试方案
+  -> 测试用例
+  -> 自动化实现和执行请求
+  -> review gate
+  -> Codex handoff
+  -> 报告
+```
+
+### Inline 晋升为 Pipeline
+
+Inline 可以晋升为 Pipeline。如果用户在 Inline 阶段补充、确认、否定或修改了需求、测试范围、测试点或用例表，这些变更应成为最新草稿。用户后续要求“保存方案”“生成文档”“进入 pipeline”“生成 handoff 包”时，应使用最新 Inline 草稿作为 Pipeline 输入，而不是从最初的粗略需求重新开始。
+
+晋升时应保留：
+
+- 原始需求
+- 最新增强需求
+- 用户已确认的假设
+- 用户否定的假设或排除范围
+- 已选择的测试范围和测试点拆解
+- 测试用例表
+- 自动化实现说明
+- 待确认问题
 
 ## 仓库结构
 
@@ -142,7 +192,7 @@ output/
 使用 auto-test-flow，帮我为这个登录需求设计测试用例，并生成 Codex handoff 任务包。
 ```
 
-如果只是轻量设计，agent 可以直接在对话中输出方案；如果需要可审计、可落盘的产物，就让它运行 pipeline 或生成文件。
+如果只是轻量设计，agent 可以直接在对话中输出方案，但仍应展示需求分析、测试范围、测试点、用例表、实现计划和待确认问题。如果需要可审计、可落盘的产物，就让它运行 pipeline，或把最新 Inline 草稿晋升为 pipeline 产物。
 
 ## 安全规则
 
@@ -155,10 +205,12 @@ output/
 
 ## 版本
 
-当前版本：`v0.3.0`
+当前版本：`v0.3.1`
 
 本版本重点：
 
+- 明确 Inline 与 Pipeline 的模式差异。
+- 增加 Inline 晋升 Pipeline 的规则。
 - Phase 2.6 pipeline 编排。
 - 基于 DeepSeek 的测试分析。
 - Codex handoff 前的 review policy gate。

@@ -18,15 +18,47 @@ Use this skill to act as a senior QA automation engineer. Take a rough testing r
 
 ## Two Modes
 
-This skill supports two modes. Choose based on whether the user wants a quick design answer or saved workflow artifacts:
+This skill supports two modes. Choose based on whether the user wants a quick design answer or saved workflow artifacts. Both modes must preserve the same QA workflow shape: requirement refinement, test design, automation planning, user confirmation, implementation, execution, and report. Inline mode is the lightweight draft version of Pipeline mode, not permission to skip requirement analysis or test case design.
 
-**Inline mode** (default, lightweight): Generate the refined requirement and test plan directly in conversation. Fast, no files written. Good for quick exploration or when the user just wants to see the plan.
+**Inline mode** (default, lightweight): Generate the refined requirement, test scope, test point breakdown, test case table, automation implementation plan, and need-confirmation questions directly in conversation. Fast, no files written. Good for quick exploration, early requirement shaping, or when the user wants to see the plan before creating files.
 
 **Pipeline mode** (persistent, auditable): Run the bundled `scripts/orchestrator.py` to produce standardized Markdown and JSON artifacts. The Phase 2.6 pipeline turns a rough requirement into a saved handoff package for later Codex/GPT-5.5 automation implementation and execution, with a review policy gate before Codex handoff. Use this when the user:
 - Wants a saved `.md` test plan file for review/sharing
 - Needs intermediate artifacts (boosted requirement, structured fields JSON, structured cases JSON)
 - Asks for "输出文件" or "保存方案" or "生成文档"
 - Is working in a regulated/auditable context
+
+Inline mode minimum output:
+
+1. Refined requirement
+2. Assumptions and need-confirmation questions
+3. Test scope
+4. Test point breakdown
+5. Test case table with priority
+6. Automation implementation plan
+7. Proposed code-change files, reasons, and validation commands when code is requested
+
+Do not jump from a rough testing request directly to code discovery or code-change planning unless the user explicitly asks for a quick repository diagnosis only.
+
+### Inline To Pipeline Promotion
+
+Treat Inline mode as the draft layer for Pipeline mode. If the user edits, confirms, rejects, or expands an inline requirement, test plan, or test case table, preserve the latest inline version as the canonical draft.
+
+When the user later asks to enter pipeline mode, generate files, save the plan, create formal artifacts, or produce a Codex handoff package, promote the latest inline draft into Pipeline mode instead of restarting from the original raw request.
+
+The promoted Pipeline input must include:
+
+- Original raw requirement
+- Latest refined requirement
+- User-confirmed assumptions
+- User-rejected assumptions or scope exclusions
+- Selected test scope
+- Test point breakdown
+- Test case table
+- Automation implementation notes
+- Need-confirmation questions
+
+Do not discard inline changes during promotion.
 
 The pipeline creates a dedicated folder per run under the current working directory:
 ```
@@ -103,6 +135,8 @@ Read `report.md`, `test_plan.md`, `test_cases.md`, and `codex_task.md` to presen
 If the user wants quick progress, continue with explicit assumptions instead of waiting.
 
 Use `references/test-requirement-template.md` for the canonical Chinese requirement structure and output format.
+
+Inline refinement must visibly produce a short requirement-analysis artifact before any implementation plan. At minimum, include the refined requirement, assumptions, test scope, test points, and need-confirmation questions. If code is likely, include this before repository edits and before the user confirmation gate.
 
 ### 2. Project Discovery
 
