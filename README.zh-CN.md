@@ -1,6 +1,6 @@
 # auto-test-flow
 
-版本：`v0.3.1`
+版本：`v0.4`
 
 [English README](README.md)
 
@@ -12,6 +12,7 @@
 - Pipeline 模式用于把同一套流程落盘成可审计的 Markdown 和 JSON 产物。
 - DeepSeek v4-pro 负责需求分析和结构化测试产物。
 - pipeline 会在需求增强后暂停，允许用户审查或编辑增强需求，再继续生成后续产物。
+- 在生成测试方案前，pipeline 会先发现本地项目已有结构，并把这些上下文注入后续 prompt。
 - review policy gate 在交给 Codex 前审查生成结果。
 - 每次 pipeline 会生成离线 `index.html` 查看页，方便在浏览器中阅读 Markdown 和 JSON 产物。
 - Codex/GPT-5.5 接收专门的 handoff 任务包，负责项目发现、代码修改计划、测试实现、执行与修复。
@@ -56,6 +57,7 @@ Pipeline 会把同一套概念流程持久化：
   -> 增强需求
   -> 增强需求审查/编辑 gate
   -> 结构化字段
+  -> 项目上下文发现
   -> 测试方案
   -> 测试用例
   -> 自动化实现和执行请求
@@ -189,6 +191,8 @@ output/
     index.html
     boosted_requirement.md
     fields.json
+    project_context_discovery.md
+    project_context_discovery.json
     test_plan.md
     test_cases.md
     test_cases.json
@@ -227,13 +231,15 @@ output/
 
 ## 版本
 
-当前版本：`v0.3.1`
+当前版本：`v0.4`
 
 本版本重点：
 
 - 明确 Inline 与 Pipeline 的模式差异。
 - 增加 Inline 晋升 Pipeline 的规则。
 - 增加增强需求审查/编辑 gate，避免 boost 后直接生成下游产物。
+- 增加测试方案生成前的项目上下文发现，先读取已有代码结构、框架信号、相关文件和推荐命令。
+- 增加项目结构约束，减少臆造文件、类、选择器、fixture 和通用运行命令。
 - Phase 2.6 pipeline 编排。
 - 增加离线 HTML 产物查看页。
 - 基于 DeepSeek 的测试分析。

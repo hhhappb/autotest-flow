@@ -1,6 +1,6 @@
 # auto-test-flow
 
-Version: `v0.3.1`
+Version: `v0.4`
 
 [中文说明](README.zh-CN.md)
 
@@ -12,6 +12,7 @@ The current release focuses on a two-mode QA workflow:
 - Pipeline mode persists the same workflow into auditable Markdown and JSON artifacts.
 - DeepSeek v4-pro handles requirement analysis and structured testing artifacts.
 - The pipeline pauses after requirement boosting so users can review or edit the boosted requirement before downstream artifacts are generated.
+- Before generating the test plan, the pipeline discovers the existing local project structure and injects that context into downstream prompts.
 - A review policy gate checks generated artifacts before code handoff.
 - Each pipeline run writes an offline `index.html` viewer for browsing Markdown and JSON artifacts in a browser.
 - Codex/GPT-5.5 receives a dedicated handoff package for project discovery, code-change planning, test implementation, execution, and repair.
@@ -56,6 +57,7 @@ raw requirement
   -> boosted requirement
   -> boosted requirement review/edit gate
   -> structured fields
+  -> project context discovery
   -> test plan
   -> test cases
   -> automation and execution requests
@@ -189,6 +191,8 @@ output/
     index.html
     boosted_requirement.md
     fields.json
+    project_context_discovery.md
+    project_context_discovery.json
     test_plan.md
     test_cases.md
     test_cases.json
@@ -227,13 +231,15 @@ For lightweight planning, the agent can answer inline without running the pipeli
 
 ## Version
 
-Current version: `v0.3.1`
+Current version: `v0.4`
 
 Release focus:
 
 - Clear Inline vs Pipeline mode definitions.
 - Inline-to-Pipeline promotion rules.
 - Boosted requirement review/edit gate before downstream generation.
+- Project context discovery before test plan, test case, automation request, and execution request generation.
+- Project-structure constraints that discourage invented files, classes, selectors, fixtures, and generic commands.
 - Phase 2.6 pipeline orchestration.
 - Offline HTML artifact viewer.
 - DeepSeek-powered test analysis.

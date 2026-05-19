@@ -22,7 +22,7 @@ This skill supports two modes. Choose based on whether the user wants a quick de
 
 **Inline mode** (default, lightweight): Generate the refined requirement, test scope, test point breakdown, test case table, automation implementation plan, and need-confirmation questions directly in conversation. Fast, no files written. Good for quick exploration, early requirement shaping, or when the user wants to see the plan before creating files.
 
-**Pipeline mode** (persistent, auditable): Run the bundled `scripts/orchestrator.py` to produce standardized Markdown and JSON artifacts. The Phase 2.6 pipeline turns a rough requirement into a saved handoff package for later Codex/GPT-5.5 automation implementation and execution. After boosting the raw requirement, the pipeline pauses for the user to review or edit `boosted_requirement.md`; the confirmed boosted requirement becomes the source of truth for later artifacts. A separate review policy gate still runs before Codex handoff. Use this when the user:
+**Pipeline mode** (persistent, auditable): Run the bundled `scripts/orchestrator.py` to produce standardized Markdown and JSON artifacts. The Phase 2.6 pipeline turns a rough requirement into a saved handoff package for later Codex/GPT-5.5 automation implementation and execution. After boosting the raw requirement, the pipeline pauses for the user to review or edit `boosted_requirement.md`; the confirmed boosted requirement becomes the source of truth for later artifacts. Before generating the test plan, it discovers the existing local project structure and injects that context into the plan, case, automation request, and execution request prompts. A separate review policy gate still runs before Codex handoff. Use this when the user:
 - Wants a saved `.md` test plan file for review/sharing
 - Needs intermediate artifacts (boosted requirement, structured fields JSON, structured cases JSON)
 - Asks for "输出文件" or "保存方案" or "生成文档"
@@ -67,6 +67,8 @@ output/
     raw_requirement.txt         # Original user requirement
     boosted_requirement.md      # Refined requirement
     fields.json                 # Structured fields (machine-readable)
+    project_context_discovery.md # Discovered local project structure and hard constraints
+    project_context_discovery.json # Machine-readable discovered project context
     test_plan.md                # Human-readable test plan
     test_cases.md               # Human-readable test case table
     test_cases.json             # Structured test cases (machine-readable)
@@ -80,12 +82,13 @@ output/
     report.md                   # Phase summary and remaining questions
 ```
 
-All artifacts are produced together so later LangChain/LangGraph nodes can consume stable files instead of scraping chat text. In Phase 2.6, DeepSeek handles test analysis and structured artifacts, the review gate checks whether the generated artifacts are safe to hand off, and `codex_task.md`/`codex_task.json` hand code implementation to Codex/GPT-5.5. The pipeline still does not modify project code or run tests by itself.
+All artifacts are produced together so later LangChain/LangGraph nodes can consume stable files instead of scraping chat text. In Phase 2.6, DeepSeek handles requirement analysis and structured artifacts, the orchestrator performs deterministic local project context discovery before downstream generation, the review gate checks whether generated artifacts are safe to hand off, and `codex_task.md`/`codex_task.json` hand code implementation to Codex/GPT-5.5. The pipeline still does not modify project code or run tests by itself.
 
 ## Model Responsibility Split
 
-- DeepSeek v4-pro: requirement boosting, field extraction, test plan generation, structured test case generation, automation request generation, and execution request generation.
-- Codex/GPT-5.5: project discovery, code-change planning, automated test implementation, test execution, failure repair, and final code-level report.
+- DeepSeek v4-pro: requirement boosting, field extraction, test plan generation, structured test case generation, automation request generation, and execution request generation, constrained by discovered project context.
+- Orchestrator: deterministic local project context discovery before test plan generation.
+- Codex/GPT-5.5: project discovery verification, code-change planning, automated test implementation, test execution, failure repair, and final code-level report.
 - User confirmation gate: before Codex modifies code, selectors, page objects, or test flow, it must first list the files, intended changes, reasons, and validation commands, then wait for explicit user confirmation.
 
 ## Review Policy
@@ -114,7 +117,7 @@ The review gate checks for signals such as excessive test case scope, too many a
 
 Convert the user's raw request into a structured testing brief.
 
-**Pipeline mode**: Run the orchestrator script. It executes a Phase 2.6 pipeline (boost → review/edit boosted requirement → extract fields → generate plan → generate cases → build automation request → build execution request → review gate → build Codex handoff → save report) via API and saves all artifacts as files.
+**Pipeline mode**: Run the orchestrator script. It executes a Phase 2.6 pipeline (boost → review/edit boosted requirement → extract fields → discover project context → generate plan → generate cases → build automation request → build execution request → review gate → build Codex handoff → save report) via API and saves all artifacts as files.
 
 After boost, the script saves a review folder containing `raw_requirement.txt`, `boosted_requirement.md`, and `index.html`, then waits for confirmation:
 - Enter `yes`/`继续` to continue with the current boosted requirement.
@@ -176,7 +179,7 @@ Coverage must include, as applicable:
 
 When the user asks for automation, select a practical subset for the first implementation. Prefer P0/P1 cases and high-risk paths.
 
-**Pipeline mode note**: When using the orchestrator script, the plan and cases are saved as both human-readable Markdown and machine-readable JSON. Read them to present results. If the user wants code, treat `codex_task.md`, `codex_task.json`, and `project_context_request.json` as the handoff artifacts for Step 4 and still inspect the target project before writing files.
+**Pipeline mode note**: When using the orchestrator script, the plan and cases are saved as both human-readable Markdown and machine-readable JSON. Read them to present results. Also read `project_context_discovery.md` / `project_context_discovery.json` to understand the project structure and hard constraints that shaped the generated artifacts. If the user wants code, treat `codex_task.md`, `codex_task.json`, `project_context_discovery.json`, and `project_context_request.json` as the handoff artifacts for Step 4 and still inspect the target project before writing files.
 
 ### 4. Automation Implementation
 
@@ -233,6 +236,8 @@ output/
     raw_requirement.txt
     boosted_requirement.md
     fields.json
+    project_context_discovery.md
+    project_context_discovery.json
     test_plan.md
     test_cases.md
     test_cases.json

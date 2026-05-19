@@ -77,6 +77,7 @@ class TestWorkflowOrchestrator:
         )
         self.boosted_text = ""
         self.fields = {}
+        self.project_context_discovery = {}
         self.test_plan = ""
         self.test_cases = {}
         self.automation_request = {}
@@ -177,6 +178,46 @@ class TestWorkflowOrchestrator:
         self.fields = self._ensure_dict(self._parse_json(fields_json), "fields")
         print(json.dumps(self.fields, ensure_ascii=False, indent=2))
         return self.fields
+
+    def step_discover_project_context(self, raw_requirement: str) -> dict:
+        """Discover existing project structure before generating plan and cases."""
+        print("=" * 60)
+        print("[Step 2.5/9] Discovering existing project context...")
+        print("=" * 60)
+
+        project_root = self._select_project_root(raw_requirement)
+        if not project_root:
+            self.project_context_discovery = {
+                "status": "not_found",
+                "project_root": None,
+                "framework_signals": [],
+                "relevant_files": [],
+                "key_snippets": [],
+                "recommended_commands": [],
+                "hard_constraints": [
+                    "No local project root was discovered before artifact generation.",
+                    "Downstream artifacts must ask Codex to inspect the repository before proposing files, classes, selectors, fixtures, or commands.",
+                    "Do not invent project paths, page objects, selectors, fixtures, or execution commands.",
+                ],
+                "forbidden_patterns": [],
+                "notes": [
+                    "Provide a concrete project path in the requirement for stronger project-aware generation.",
+                ],
+            }
+            print("No project root discovered; downstream prompts will require repository inspection.")
+            return self.project_context_discovery
+
+        self.project_context_discovery = self._collect_project_context(
+            project_root=project_root,
+            raw_requirement=raw_requirement,
+        )
+        print(json.dumps({
+            "status": self.project_context_discovery.get("status"),
+            "project_root": self.project_context_discovery.get("project_root"),
+            "relevant_files": self.project_context_discovery.get("relevant_files", [])[:8],
+            "recommended_commands": self.project_context_discovery.get("recommended_commands", []),
+        }, ensure_ascii=False, indent=2))
+        return self.project_context_discovery
 
     # ═══ Step 3: Generate Test Plan ═══
     def step_generate_test_plan(self) -> str:
@@ -297,6 +338,8 @@ class TestWorkflowOrchestrator:
                    execution_request.json
                    review_result.json
                    review_notes.md
+                   project_context_discovery.md
+                   project_context_discovery.json
                    project_context_request.json
                    codex_task.json
                    codex_task.md
@@ -317,6 +360,8 @@ class TestWorkflowOrchestrator:
         self._write_text(run_dir / "raw_requirement.txt", raw_requirement)
         self._write_text(run_dir / "boosted_requirement.md", self.boosted_text)
         self._write_json(run_dir / "fields.json", self.fields)
+        self._write_json(run_dir / "project_context_discovery.json", self.project_context_discovery)
+        self._write_text(run_dir / "project_context_discovery.md", self._build_project_context_discovery_markdown())
         self._write_text(run_dir / "test_plan.md", self._build_test_plan_markdown())
         self._write_text(run_dir / "test_cases.md", self._build_cases_markdown())
         self._write_json(run_dir / "test_cases.json", self.test_cases)
@@ -335,6 +380,8 @@ class TestWorkflowOrchestrator:
         print("  ├── index.html")
         print("  ├── boosted_requirement.md")
         print("  ├── fields.json")
+        print("  ├── project_context_discovery.md")
+        print("  ├── project_context_discovery.json")
         print("  ├── test_plan.md")
         print("  ├── test_cases.md")
         print("  ├── test_cases.json")
@@ -360,6 +407,7 @@ class TestWorkflowOrchestrator:
     def _build_html_viewer(self, run_dir: Path) -> str:
         """Build an offline HTML viewer for generated Markdown and JSON artifacts."""
         files = [
+            ("Project Context Discovery", "project_context_discovery.md"),
             ("报告", "report.md"),
             ("测试方案", "test_plan.md"),
             ("测试用例", "test_cases.md"),
@@ -372,6 +420,7 @@ class TestWorkflowOrchestrator:
             ("实现请求", "automation_request.json"),
             ("执行请求", "execution_request.json"),
             ("审查结果", "review_result.json"),
+            ("Project Context Discovery JSON", "project_context_discovery.json"),
             ("项目上下文请求", "project_context_request.json"),
             ("Codex 任务 JSON", "codex_task.json"),
         ]
@@ -704,6 +753,392 @@ class TestWorkflowOrchestrator:
         review_dir.mkdir(parents=True, exist_ok=True)
         return review_dir
 
+    def _select_project_root(self, raw_requirement: str) -> Path | None:
+        """Pick the strongest local project root candidate without using the API."""
+        candidates = []
+        source_text = "\n".join([
+            raw_requirement or "",
+            self.boosted_text or "",
+            json.dumps(self.fields, ensure_ascii=False),
+        ])
+
+        for match in re.findall(r"[A-Za-z]:\\[^\r\n\"'<>|]+", source_text):
+            cleaned = match.strip().rstrip(".,;:，。；：)）]")
+            candidates.append(Path(cleaned))
+
+        cwd = Path.cwd()
+        for base in [cwd, *cwd.parents]:
+            candidates.append(base / "auto-test")
+            candidates.append(base)
+
+        seen = set()
+        scored = []
+        for candidate in candidates:
+            root = self._normalize_project_root(candidate)
+            if not root:
+                continue
+            key = str(root).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            score = self._score_project_root(root)
+            if score > 0:
+                scored.append((score, root))
+
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (item[0], len(str(item[1]))), reverse=True)
+        return scored[0][1]
+
+    @staticmethod
+    def _normalize_project_root(path: Path) -> Path | None:
+        try:
+            if not path.exists():
+                return None
+            current = path if path.is_dir() else path.parent
+            markers = {
+                "pytest.ini",
+                "pyproject.toml",
+                "package.json",
+                "pom.xml",
+                "build.gradle",
+                "project",
+                "tests",
+                "src",
+            }
+            for candidate in [current, *current.parents]:
+                if any((candidate / marker).exists() for marker in markers):
+                    return candidate.resolve()
+            return current.resolve()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _score_project_root(root: Path) -> int:
+        score = 0
+        marker_weights = {
+            "pytest.ini": 6,
+            "pyproject.toml": 5,
+            "package.json": 5,
+            "conftest.py": 4,
+            "runner.py": 3,
+            "project": 4,
+            "tests": 3,
+            "src": 2,
+        }
+        for marker, weight in marker_weights.items():
+            if (root / marker).exists():
+                score += weight
+        if root.name.lower() == "auto-test":
+            score += 8
+        if (root / "project" / "feikua").exists():
+            score += 8
+        return score
+
+    def _collect_project_context(self, project_root: Path, raw_requirement: str) -> dict:
+        terms = self._derive_discovery_terms(raw_requirement)
+        framework_signals = self._discover_framework_signals(project_root)
+        relevant_files = self._find_relevant_files(project_root, terms)
+        snippets = [
+            self._build_file_snippet(project_root / item["path"], terms)
+            for item in relevant_files[:10]
+        ]
+        snippets = [item for item in snippets if item]
+        recommended_commands = self._infer_recommended_commands(project_root, relevant_files)
+        hard_constraints, forbidden_patterns, notes = self._infer_project_constraints(
+            project_root=project_root,
+            relevant_files=relevant_files,
+            terms=terms,
+        )
+        return {
+            "status": "discovered",
+            "project_root": str(project_root),
+            "framework_signals": framework_signals,
+            "relevant_files": relevant_files[:20],
+            "key_snippets": snippets,
+            "recommended_commands": recommended_commands,
+            "hard_constraints": hard_constraints,
+            "forbidden_patterns": forbidden_patterns,
+            "notes": notes,
+        }
+
+    def _derive_discovery_terms(self, raw_requirement: str) -> list[str]:
+        source = "\n".join([
+            raw_requirement or "",
+            self.boosted_text or "",
+            json.dumps(self.fields, ensure_ascii=False),
+        ]).lower()
+        terms = set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}", source))
+        terms.update(re.findall(r"[\u4e00-\u9fff]{2,}", source))
+
+        if any(token in source for token in ["finger", "fingerprint", "finger_print", "指纹"]):
+            terms.update([
+                "finger",
+                "fingerprint",
+                "finger_print",
+                "指纹",
+                "screen",
+                "timezone",
+                "language",
+                "cpu",
+                "device",
+                "device_memory",
+                "deviceMemory",
+                "browser",
+                "store",
+            ])
+        if "screen" in source or "屏幕" in source:
+            terms.update(["screen", "屏幕"])
+        if "timezone" in source or "时区" in source:
+            terms.update(["timezone", "时区"])
+        if "language" in source or "语言" in source:
+            terms.update(["language", "语言"])
+
+        noisy = {"the", "and", "for", "with", "this", "that", "json", "true", "false"}
+        return sorted(term for term in terms if term not in noisy)
+
+    @staticmethod
+    def _discover_framework_signals(project_root: Path) -> list[dict]:
+        signal_names = [
+            "pytest.ini",
+            "conftest.py",
+            "requirements.txt",
+            "requirements",
+            "pyproject.toml",
+            "package.json",
+            "playwright.config.ts",
+            "playwright.config.js",
+            "cypress.config.ts",
+            "cypress.config.js",
+            "runner.py",
+        ]
+        signals = []
+        for name in signal_names:
+            path = project_root / name
+            if path.exists():
+                signals.append({"path": name, "type": "file" if path.is_file() else "directory"})
+        return signals
+
+    def _find_relevant_files(self, project_root: Path, terms: list[str]) -> list[dict]:
+        scored_files = []
+        allowed_suffixes = {".py", ".js", ".ts", ".tsx", ".jsx", ".md", ".json", ".ini", ".toml", ".yaml", ".yml"}
+        ignored_parts = {
+            ".git",
+            ".venv",
+            "venv",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+            "allure-results",
+            "allure-report",
+            "logs",
+            "output",
+            "report",
+            "reports",
+            "testreport",
+            "dist",
+            "build",
+        }
+
+        for path in self._iter_project_files(project_root):
+            relative = path.relative_to(project_root)
+            parts = {part.lower() for part in relative.parts}
+            if parts & ignored_parts:
+                continue
+            if path.suffix.lower() not in allowed_suffixes:
+                continue
+            rel_text = str(relative).replace("\\", "/").lower()
+            score = 0
+            matched = set()
+            for term in terms:
+                lowered = term.lower()
+                if lowered and lowered in rel_text:
+                    score += 8
+                    matched.add(term)
+            if score == 0:
+                score += self._score_file_content(path, terms, matched)
+            else:
+                score += self._score_file_content(path, terms, matched)
+            if score:
+                scored_files.append({
+                    "path": str(relative).replace("\\", "/"),
+                    "score": score,
+                    "matched_terms": sorted(matched)[:12],
+                })
+
+        scored_files.sort(key=lambda item: (item["score"], -len(item["path"])), reverse=True)
+        return scored_files
+
+    @staticmethod
+    def _iter_project_files(project_root: Path):
+        try:
+            for path in project_root.rglob("*"):
+                if path.is_file():
+                    yield path
+        except OSError:
+            return
+
+    @staticmethod
+    def _score_file_content(path: Path, terms: list[str], matched: set) -> int:
+        try:
+            if path.stat().st_size > 250_000:
+                return 0
+            text = path.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            return 0
+        score = 0
+        for term in terms:
+            lowered = term.lower()
+            if lowered and lowered in text:
+                count = min(text.count(lowered), 5)
+                score += count
+                matched.add(term)
+        return score
+
+    @staticmethod
+    def _build_file_snippet(path: Path, terms: list[str]) -> dict | None:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            return None
+        term_lowers = [term.lower() for term in terms if term]
+        matched_indexes = []
+        matched_terms = set()
+        for index, line in enumerate(lines):
+            lowered = line.lower()
+            line_terms = [term for term in term_lowers if term in lowered]
+            if line_terms:
+                matched_indexes.append(index)
+                matched_terms.update(line_terms[:6])
+            if len(matched_indexes) >= 6:
+                break
+
+        if not matched_indexes:
+            selected_indexes = range(0, min(len(lines), 35))
+        else:
+            indexes = set()
+            for index in matched_indexes[:4]:
+                indexes.update(range(max(0, index - 2), min(len(lines), index + 3)))
+            selected_indexes = sorted(indexes)[:50]
+
+        snippet_lines = [
+            f"{index + 1}: {lines[index]}"
+            for index in selected_indexes
+        ]
+        return {
+            "path": str(path),
+            "matched_terms": sorted(matched_terms)[:12],
+            "snippet": "\n".join(snippet_lines),
+        }
+
+    @staticmethod
+    def _infer_recommended_commands(project_root: Path, relevant_files: list[dict]) -> list[str]:
+        commands = []
+        relevant_paths = [item.get("path", "") for item in relevant_files]
+        fingerprint_test = "project/feikua/testcases/test_finger_print.py"
+        if fingerprint_test in relevant_paths:
+            commands.append(
+                r"venv\Scripts\python.exe -m pytest project\feikua\testcases\test_finger_print.py::TestFingerPrintCompare::test_compare_browser_and_store_fingerprints -q --reruns 0"
+            )
+        elif (project_root / "pytest.ini").exists():
+            first_test = next((path for path in relevant_paths if path.endswith(".py") and "/test" in path), None)
+            if first_test:
+                first_test_windows = first_test.replace("/", "\\")
+                commands.append(fr"venv\Scripts\python.exe -m pytest {first_test_windows} -q")
+            else:
+                commands.append(r"venv\Scripts\python.exe -m pytest -q")
+        if (project_root / "package.json").exists():
+            commands.append("npm test")
+        return commands
+
+    @staticmethod
+    def _infer_project_constraints(project_root: Path, relevant_files: list[dict],
+                                   terms: list[str]) -> tuple[list[str], list[str], list[str]]:
+        relevant_paths = {item.get("path", "") for item in relevant_files}
+        hard_constraints = [
+            "Treat project_context_discovery as the source of truth for file layout, framework, and execution commands.",
+            "Prefer existing files, page objects, selectors, fixtures, helpers, naming, and assertion style over introducing new structure.",
+            "Do not propose new files, classes, selectors, fixtures, or commands that conflict with discovered project files.",
+        ]
+        forbidden_patterns = []
+        notes = []
+        term_text = " ".join(terms).lower()
+
+        if "finger" in term_text or "fingerprint" in term_text or "finger_print" in term_text or "指纹" in term_text:
+            if "project/feikua/testcases/test_finger_print.py" in relevant_paths:
+                hard_constraints.append("Reuse project/feikua/testcases/test_finger_print.py for fingerprint automation unless the user explicitly approves a new test file.")
+            if "project/feikua/pages/login_page/finger_print_page/finger_print_page.py" in relevant_paths:
+                hard_constraints.append("Reuse FingerPrintPage in project/feikua/pages/login_page/finger_print_page/finger_print_page.py for fingerprint page operations.")
+            if "project/feikua/selectors/finger_print_selectors.py" in relevant_paths:
+                hard_constraints.append("Reuse and extend FingerprintSelectors in project/feikua/selectors/finger_print_selectors.py for fingerprint locators.")
+            hard_constraints.append("Preserve existing fingerprint assertion logic: enabled spoofing means store value differs from the real browser; disabled spoofing means store value equals the real browser.")
+            hard_constraints.append("Keep first implementation scoped to screen, timezone, and language unless the confirmed requirement expands scope.")
+            forbidden_patterns.extend([
+                "ShopEditPage",
+                "test_fingerprint_screen_timezone_language.py",
+                "pytest tests/",
+                "new fixture",
+                "new selector file",
+            ])
+            notes.append("Fingerprint-specific constraints were inferred from discovered feikua fingerprint files.")
+
+        if not relevant_files:
+            notes.append("No relevant files matched the requirement terms; downstream artifacts must request more project inspection.")
+
+        return hard_constraints, forbidden_patterns, notes
+
+    def _project_context_prompt(self) -> str:
+        if not self.project_context_discovery:
+            return "Project context discovery has not run. Do not invent project files or commands."
+        return f"""Project context discovery has already inspected the local repository before this artifact was generated.
+You must obey the discovered project_root, framework_signals, relevant_files, recommended_commands, and hard_constraints.
+If a requested file/class/fixture/command conflicts with discovery, prefer discovery and add a need-confirmation item.
+Do not invent files, classes, selectors, fixtures, or execution commands that conflict with this context.
+
+{self._json_block(self.project_context_discovery)}"""
+
+    def _build_project_context_discovery_markdown(self) -> str:
+        context = self.project_context_discovery or {}
+        lines = [
+            "# Project Context Discovery",
+            "",
+            f"- Status: {context.get('status', 'not_run')}",
+            f"- Project root: {context.get('project_root') or 'not discovered'}",
+            "",
+            "## Framework Signals",
+        ]
+        signals = context.get("framework_signals", [])
+        lines.extend(self._markdown_bullets(
+            f"{item.get('path')} ({item.get('type')})" for item in signals
+        ))
+        lines.extend(["", "## Relevant Files"])
+        lines.extend(self._markdown_bullets(
+            f"{item.get('path')} - score {item.get('score')} - matched: {', '.join(item.get('matched_terms', []))}"
+            for item in context.get("relevant_files", [])
+        ))
+        lines.extend(["", "## Recommended Commands"])
+        lines.extend(self._markdown_bullets(context.get("recommended_commands", [])))
+        lines.extend(["", "## Hard Constraints"])
+        lines.extend(self._markdown_bullets(context.get("hard_constraints", [])))
+        lines.extend(["", "## Key Snippets"])
+        for snippet in context.get("key_snippets", []):
+            lines.extend([
+                "",
+                f"### {snippet.get('path')}",
+                "",
+                "```text",
+                snippet.get("snippet", ""),
+                "```",
+            ])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _markdown_bullets(items) -> list[str]:
+        values = [str(item) for item in items if item]
+        if not values:
+            return ["- None"]
+        return [f"- {item}" for item in values]
+
     @staticmethod
     def _parse_json(text: str):
         """Parse JSON from LLM output, handling markdown code blocks."""
@@ -752,42 +1187,55 @@ class TestWorkflowOrchestrator:
         return str(value).replace("\n", "<br>").replace("|", "\\|")
 
     def _build_test_plan_user_prompt(self, fields: dict) -> str:
-        """Build user prompt from fields dict for test plan generation."""
+        """Build a project-aware user prompt for test plan generation."""
         return f"""请根据以下信息生成测试方案：
 
-【测试对象】
-{self._fmt(fields.get('test_object'))}
+【项目上下文发现（必须遵守）】
+{self._project_context_prompt()}
 
-【业务背景】
-{self._fmt(fields.get('business_context'))}
+【测试对象】{self._fmt(fields.get('test_object'))}
 
-【核心需求】
-{self._fmt(fields.get('core_requirements'))}
+【业务背景】{self._fmt(fields.get('business_context'))}
 
-【用户角色】
-{self._fmt(fields.get('user_roles'))}
+【核心需求】{self._fmt(fields.get('core_requirements'))}
 
-【输入条件】
-{self._fmt(fields.get('input_conditions'))}
+【用户角色】{self._fmt(fields.get('user_roles'))}
 
-【预期结果】
-{self._fmt(fields.get('expected_results'))}
+【输入条件】{self._fmt(fields.get('input_conditions'))}
 
-【异常情况】
-{self._fmt(fields.get('exception_scenarios'))}"""
+【预期结果】{self._fmt(fields.get('expected_results'))}
+
+【异常场景】{self._fmt(fields.get('exception_scenarios'))}
+
+要求：
+1. 项目上下文发现是文件结构、框架、已有测试逻辑和执行命令的事实来源。
+2. 测试方案必须复用已有测试结构，不能臆造与项目上下文冲突的页面对象、选择器、fixture、测试文件或命令。
+3. 如果需求与已有代码逻辑存在不确定点，请写入待确认问题，不要把假设写成确定预期。"""
 
     def _build_test_cases_user_prompt(self) -> str:
-        return f"""请基于以下结构化字段和测试方案生成结构化测试用例 JSON。
+        """Build a project-aware user prompt for structured test cases."""
+        return f"""请基于以下结构化字段、项目上下文发现和测试方案生成结构化测试用例 JSON。
+
+【项目上下文发现（必须遵守）】
+{self._project_context_prompt()}
 
 【结构化字段】
 {self._json_block(self.fields)}
 
 【测试方案】
 {self.test_plan}
-"""
+
+要求：
+1. 用例预期必须以项目上下文和已有代码逻辑为准。
+2. 不要因为常见直觉推翻已有测试逻辑；如果与直觉冲突，把原因写入 assumptions 或 need_confirmation。
+3. 不要输出要求新增未知测试文件、未知页面对象、未知 fixture 的用例前置条件。"""
 
     def _build_automation_request_prompt(self) -> str:
+        """Build a project-aware automation handoff prompt."""
         return f"""请基于以下信息生成自动化脚本实现请求 JSON。注意：只生成请求，不输出代码。
+
+【项目上下文发现（必须遵守）】
+{self._project_context_prompt()}
 
 【结构化字段】
 {self._json_block(self.fields)}
@@ -797,10 +1245,18 @@ class TestWorkflowOrchestrator:
 
 【结构化测试用例】
 {self._json_block(self.test_cases)}
-"""
+
+要求：
+1. suggested_changes 必须优先指向已发现的现有文件。
+2. 除非项目上下文明确没有可复用位置，否则不要建议新建测试文件、页面对象、选择器文件或 fixture。
+3. 不要建议与 project_context_discovery.hard_constraints 或 forbidden_patterns 冲突的内容。"""
 
     def _build_execution_request_prompt(self) -> str:
+        """Build a project-aware execution handoff prompt."""
         return f"""请基于以下信息生成测试执行请求 JSON。注意：只生成执行计划，不真正执行测试。
+
+【项目上下文发现（必须遵守）】
+{self._project_context_prompt()}
 
 【结构化字段】
 {self._json_block(self.fields)}
@@ -810,7 +1266,11 @@ class TestWorkflowOrchestrator:
 
 【自动化脚本实现请求】
 {self._json_block(self.automation_request)}
-"""
+
+要求：
+1. 优先使用 project_context_discovery.recommended_commands。
+2. 不要输出通用的 pytest tests/、npm test 等命令，除非项目上下文明确支持。
+3. 如果执行前需要登录账号、浏览器进程、环境变量或测试数据，写入 pre_run_checks。"""
 
     def _build_review_result(self) -> dict:
         """Review artifacts with deterministic risk rules before Codex handoff."""
@@ -825,6 +1285,30 @@ class TestWorkflowOrchestrator:
             selected_cases = [selected_cases]
         if isinstance(context_needed, str):
             context_needed = [context_needed]
+
+        generated_text = json.dumps({
+            "test_cases": self.test_cases,
+            "automation_request": self.automation_request,
+            "execution_request": self.execution_request,
+        }, ensure_ascii=False)
+        for pattern in self.project_context_discovery.get("forbidden_patterns", []):
+            if pattern and pattern.lower() in generated_text.lower():
+                findings.append(self._finding(
+                    "high",
+                    "project_context_conflict",
+                    f"Generated artifact conflicts with project discovery forbidden pattern: {pattern}",
+                    "Regenerate or edit the artifact so it follows project_context_discovery.hard_constraints and existing project structure.",
+                ))
+
+        if self.project_context_discovery.get("status") == "discovered":
+            commands_text = "\n".join(str(item) for item in self.execution_request.get("commands", []))
+            if "pytest tests/" in commands_text.replace("\\", "/"):
+                findings.append(self._finding(
+                    "high",
+                    "execution_command_conflict",
+                    "Execution request uses a generic pytest tests/ command even though project discovery found a concrete project layout.",
+                    "Use project_context_discovery.recommended_commands or an explicitly discovered project test path.",
+                ))
 
         if len(cases) > 12:
             findings.append(self._finding(
@@ -1042,6 +1526,7 @@ class TestWorkflowOrchestrator:
                 "raw_requirement": "raw_requirement.txt",
                 "boosted_requirement": "boosted_requirement.md",
                 "fields": "fields.json",
+                "project_context_discovery": "project_context_discovery.json",
                 "test_plan": "test_plan.md",
                 "test_cases_markdown": "test_cases.md",
                 "test_cases_json": "test_cases.json",
@@ -1050,6 +1535,7 @@ class TestWorkflowOrchestrator:
                 "project_context_request": "project_context_request.json",
             },
             "selected_cases": selected_cases,
+            "project_context_discovery": self.project_context_discovery,
             "project_context_request": self.project_context_request,
             "confirmation_gate": {
                 "required": True,
@@ -1109,6 +1595,8 @@ Codex handoff was skipped by the review gate.
 - `test_cases.json`
 - `automation_request.json`
 - `execution_request.json`
+- `project_context_discovery.json`
+- `project_context_discovery.md`
 - `project_context_request.json`
 - `test_plan.md`
 - `test_cases.md`
@@ -1153,9 +1641,10 @@ Codex handoff was skipped by the review gate.
 ## 下一步建议
 
 1. 读取 `project_context_request.json`。
-2. 在目标项目中执行只读发现，确认测试框架、目录结构、页面对象、选择器、fixtures 和运行命令。
-3. 基于 `test_cases.json` 选择首批 P0/P1 自动化候选用例。
-4. 输出代码修改计划并等待用户确认。
+2. 读取 `project_context_discovery.json` / `project_context_discovery.md`，确认 pipeline 已发现的项目结构和硬约束。
+3. 在目标项目中执行只读发现，复核测试框架、目录结构、页面对象、选择器、fixtures 和运行命令。
+4. 基于 `test_cases.json` 选择首批 P0/P1 自动化候选用例。
+5. 输出代码修改计划并等待用户确认。
 """
 
     def _build_review_notes_markdown(self) -> str:
@@ -1310,6 +1799,8 @@ Codex handoff was skipped by the review gate.
 - `execution_request.json`
 - `review_result.json`
 - `review_notes.md`
+- `project_context_discovery.json`
+- `project_context_discovery.md`
 - `project_context_request.json`
 - `codex_task.json`
 - `codex_task.md`
@@ -1367,6 +1858,7 @@ Codex handoff was skipped by the review gate.
                 self.boosted_text = raw_requirement
 
             self.step_extract_fields()
+            self.step_discover_project_context(raw_requirement)
             self.step_generate_test_plan()
             self.step_generate_test_cases()
             self.step_build_automation_request()
