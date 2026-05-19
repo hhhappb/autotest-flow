@@ -21,6 +21,7 @@
 """
 
 import argparse
+import html
 import json
 import os
 import re
@@ -116,6 +117,49 @@ class TestWorkflowOrchestrator:
         )
         print(f"\n{self.boosted_text}\n")
         return self.boosted_text
+
+    def step_review_boosted_requirement(self, raw_requirement: str,
+                                        output_dir: str = None) -> str:
+        """Review and optionally edit the boosted requirement before continuing."""
+        print("=" * 60)
+        print("[Step 1.5/9] 审查增强后的测试需求...")
+        print("=" * 60)
+
+        review_dir = self._create_boost_review_dir(raw_requirement, output_dir)
+        boosted_path = review_dir / "boosted_requirement.md"
+        html_path = review_dir / "index.html"
+
+        self._write_text(review_dir / "raw_requirement.txt", raw_requirement)
+        self._write_text(boosted_path, self.boosted_text)
+        self._write_text(html_path, self._build_html_viewer(review_dir))
+
+        print(f"\n增强需求审查目录: {review_dir}")
+        print(f"  - boosted_requirement.md: {boosted_path}")
+        print(f"  - index.html: {html_path}")
+        print("\n请先审查增强后的需求。")
+        print("输入 yes/继续: 使用当前 boosted_requirement.md 继续")
+        print("输入 edit/编辑: 先编辑 boosted_requirement.md，保存后再回到这里输入 yes/继续")
+        print("输入 no/取消: 停止 pipeline")
+
+        while True:
+            try:
+                answer = input("\n是否继续使用增强后的需求？").strip().lower()
+            except EOFError as exc:
+                raise RuntimeError("Boosted requirement review requires interactive confirmation.") from exc
+
+            if answer in {"yes", "y", "继续", "确认"}:
+                self.boosted_text = boosted_path.read_text(encoding="utf-8")
+                self._write_text(html_path, self._build_html_viewer(review_dir))
+                print("\n已确认增强需求，继续后续 pipeline。")
+                return self.boosted_text
+            if answer in {"edit", "编辑", "e"}:
+                print(f"\n请编辑并保存: {boosted_path}")
+                print(f"也可以打开浏览器查看: {html_path}")
+                print("编辑完成后回到这里输入 yes/继续。")
+                continue
+            if answer in {"no", "n", "取消", "stop", "停止"}:
+                raise RuntimeError("Pipeline stopped during boosted requirement review.")
+            print("请输入 yes/继续、edit/编辑 或 no/取消。")
 
     # ═══ Step 2: Extract Fields ═══
     def step_extract_fields(self) -> dict:
@@ -284,9 +328,11 @@ class TestWorkflowOrchestrator:
         self._write_json(run_dir / "codex_task.json", self.codex_task)
         self._write_text(run_dir / "codex_task.md", self._build_codex_task_markdown())
         self._write_text(run_dir / "report.md", self._build_report_markdown(raw_requirement))
+        self._write_text(run_dir / "index.html", self._build_html_viewer(run_dir))
 
         print(f"\n输出目录: {run_dir}/")
         print("  ├── raw_requirement.txt")
+        print("  ├── index.html")
         print("  ├── boosted_requirement.md")
         print("  ├── fields.json")
         print("  ├── test_plan.md")
@@ -311,6 +357,335 @@ class TestWorkflowOrchestrator:
     def _write_json(path: Path, payload: dict) -> None:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _build_html_viewer(self, run_dir: Path) -> str:
+        """Build an offline HTML viewer for generated Markdown and JSON artifacts."""
+        files = [
+            ("报告", "report.md"),
+            ("测试方案", "test_plan.md"),
+            ("测试用例", "test_cases.md"),
+            ("审查说明", "review_notes.md"),
+            ("Codex 交接", "codex_task.md"),
+            ("增强需求", "boosted_requirement.md"),
+            ("原始需求", "raw_requirement.txt"),
+            ("结构化字段", "fields.json"),
+            ("结构化用例", "test_cases.json"),
+            ("实现请求", "automation_request.json"),
+            ("执行请求", "execution_request.json"),
+            ("审查结果", "review_result.json"),
+            ("项目上下文请求", "project_context_request.json"),
+            ("Codex 任务 JSON", "codex_task.json"),
+        ]
+
+        nav_items = []
+        sections = []
+        for index, (title, filename) in enumerate(files, start=1):
+            path = run_dir / filename
+            if not path.exists():
+                continue
+            section_id = f"doc-{index}"
+            nav_items.append(
+                f'<a href="#{section_id}"><span>{html.escape(title)}</span><small>{html.escape(filename)}</small></a>'
+            )
+            content = path.read_text(encoding="utf-8")
+            if filename.endswith(".json"):
+                body = f"<pre><code>{html.escape(content)}</code></pre>"
+            else:
+                body = self._render_markdown_fragment(content)
+            sections.append(
+                f"""
+                <section id="{section_id}" class="doc-section">
+                  <div class="doc-heading">
+                    <p>{html.escape(filename)}</p>
+                    <h2>{html.escape(title)}</h2>
+                  </div>
+                  <div class="doc-body">{body}</div>
+                </section>
+                """
+            )
+
+        return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>auto-test-flow 产物查看器</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --line: #d8dee8;
+      --accent: #1769aa;
+      --accent-soft: #e8f2fb;
+      --code: #0f172a;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.65;
+      color: var(--text);
+      background: var(--bg);
+    }}
+    .layout {{
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: 100vh;
+    }}
+    nav {{
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      padding: 24px 18px;
+      border-right: 1px solid var(--line);
+      background: #eef2f7;
+    }}
+    nav h1 {{
+      margin: 0 0 18px;
+      font-size: 20px;
+      line-height: 1.3;
+    }}
+    nav a {{
+      display: block;
+      padding: 10px 12px;
+      margin: 4px 0;
+      color: var(--text);
+      text-decoration: none;
+      border-radius: 8px;
+    }}
+    nav a:hover {{ background: var(--accent-soft); }}
+    nav span {{ display: block; font-weight: 650; }}
+    nav small {{ display: block; color: var(--muted); font-size: 12px; }}
+    main {{
+      width: min(1180px, 100%);
+      padding: 28px;
+    }}
+    .doc-section {{
+      margin: 0 0 28px;
+      padding: 28px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }}
+    .doc-heading {{
+      margin-bottom: 22px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .doc-heading p {{
+      margin: 0 0 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .doc-heading h2 {{
+      margin: 0;
+      font-size: 26px;
+      line-height: 1.25;
+    }}
+    h1, h2, h3, h4 {{ line-height: 1.35; }}
+    .doc-body h1 {{ font-size: 26px; margin: 24px 0 12px; }}
+    .doc-body h2 {{ font-size: 22px; margin: 22px 0 10px; }}
+    .doc-body h3 {{ font-size: 18px; margin: 18px 0 8px; }}
+    .doc-body h4 {{ font-size: 16px; margin: 16px 0 6px; }}
+    p {{ margin: 10px 0; }}
+    ul, ol {{ padding-left: 24px; }}
+    li {{ margin: 5px 0; }}
+    table {{
+      width: 100%;
+      margin: 16px 0;
+      border-collapse: collapse;
+      font-size: 14px;
+    }}
+    th, td {{
+      vertical-align: top;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+    }}
+    th {{
+      background: #f1f5f9;
+      text-align: left;
+      font-weight: 700;
+    }}
+    code {{
+      font-family: Consolas, "Cascadia Mono", monospace;
+      color: var(--code);
+      background: #eef2f7;
+      border-radius: 4px;
+      padding: 0 4px;
+    }}
+    pre {{
+      overflow-x: auto;
+      padding: 16px;
+      background: #111827;
+      color: #f9fafb;
+      border-radius: 8px;
+      line-height: 1.5;
+    }}
+    pre code {{
+      color: inherit;
+      background: transparent;
+      padding: 0;
+    }}
+    blockquote {{
+      margin: 14px 0;
+      padding: 8px 16px;
+      color: var(--muted);
+      border-left: 4px solid var(--accent);
+      background: #f8fafc;
+    }}
+    @media (max-width: 860px) {{
+      .layout {{ display: block; }}
+      nav {{
+        position: static;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }}
+      main {{ padding: 16px; }}
+      .doc-section {{ padding: 18px; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <nav>
+      <h1>auto-test-flow 产物</h1>
+      {''.join(nav_items)}
+    </nav>
+    <main>
+      {''.join(sections)}
+    </main>
+  </div>
+</body>
+</html>
+"""
+
+    def _render_markdown_fragment(self, text: str) -> str:
+        lines = text.splitlines()
+        html_parts = []
+        paragraph = []
+        list_stack = []
+        in_code = False
+        code_lines = []
+        i = 0
+
+        def flush_paragraph():
+            if paragraph:
+                html_parts.append(f"<p>{self._render_inline(' '.join(paragraph))}</p>")
+                paragraph.clear()
+
+        def close_lists():
+            while list_stack:
+                html_parts.append(f"</{list_stack.pop()}>")
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            if stripped.startswith("```"):
+                flush_paragraph()
+                close_lists()
+                if in_code:
+                    html_parts.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
+                    code_lines = []
+                    in_code = False
+                else:
+                    in_code = True
+                i += 1
+                continue
+
+            if in_code:
+                code_lines.append(line)
+                i += 1
+                continue
+
+            if not stripped:
+                flush_paragraph()
+                close_lists()
+                i += 1
+                continue
+
+            if stripped.startswith("|") and i + 1 < len(lines) and self._is_markdown_table_separator(lines[i + 1]):
+                flush_paragraph()
+                close_lists()
+                table_lines = [stripped, lines[i + 1].strip()]
+                i += 2
+                while i < len(lines) and lines[i].strip().startswith("|"):
+                    table_lines.append(lines[i].strip())
+                    i += 1
+                html_parts.append(self._render_table(table_lines))
+                continue
+
+            heading = re.match(r"^(#{1,4})\s+(.+)$", stripped)
+            if heading:
+                flush_paragraph()
+                close_lists()
+                level = len(heading.group(1))
+                html_parts.append(f"<h{level}>{self._render_inline(heading.group(2))}</h{level}>")
+                i += 1
+                continue
+
+            if stripped.startswith(">"):
+                flush_paragraph()
+                close_lists()
+                html_parts.append(f"<blockquote>{self._render_inline(stripped.lstrip('> ').strip())}</blockquote>")
+                i += 1
+                continue
+
+            unordered = re.match(r"^[-*]\s+(.+)$", stripped)
+            ordered = re.match(r"^\d+\.\s+(.+)$", stripped)
+            if unordered or ordered:
+                flush_paragraph()
+                tag = "ul" if unordered else "ol"
+                if not list_stack or list_stack[-1] != tag:
+                    close_lists()
+                    list_stack.append(tag)
+                    html_parts.append(f"<{tag}>")
+                item = unordered.group(1) if unordered else ordered.group(1)
+                html_parts.append(f"<li>{self._render_inline(item)}</li>")
+                i += 1
+                continue
+
+            close_lists()
+            paragraph.append(stripped)
+            i += 1
+
+        flush_paragraph()
+        close_lists()
+        if in_code:
+            html_parts.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
+        return "\n".join(html_parts)
+
+    @staticmethod
+    def _is_markdown_table_separator(line: str) -> bool:
+        return bool(re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", line))
+
+    def _render_table(self, lines: list[str]) -> str:
+        header = self._split_table_row(lines[0])
+        body_rows = [self._split_table_row(line) for line in lines[2:]]
+        header_html = "".join(f"<th>{self._render_inline(cell)}</th>" for cell in header)
+        body_html = []
+        for row in body_rows:
+            cells = row + [""] * max(0, len(header) - len(row))
+            body_html.append("<tr>" + "".join(f"<td>{self._render_inline(cell)}</td>" for cell in cells[:len(header)]) + "</tr>")
+        return f"<table><thead><tr>{header_html}</tr></thead><tbody>{''.join(body_html)}</tbody></table>"
+
+    @staticmethod
+    def _split_table_row(line: str) -> list[str]:
+        return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+    @staticmethod
+    def _render_inline(text: str) -> str:
+        escaped = html.escape(text)
+        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+        escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+        escaped = escaped.replace("&lt;br&gt;", "<br>").replace("&lt;br/&gt;", "<br>").replace("&lt;br /&gt;", "<br>")
+        return escaped
+
     @staticmethod
     def _extract_feature_name(text: str, max_len: int = 20) -> str:
         """Extract a short feature name from the raw requirement."""
@@ -320,6 +695,14 @@ class TestWorkflowOrchestrator:
                 name = name[len(prefix):]
         name = re.sub(r"[^\u4e00-\u9fff\w]", "_", name)
         return name[:max_len].strip("_") or "test_plan"
+
+    def _create_boost_review_dir(self, raw_requirement: str, output_dir: str = None) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        feature_name = self._extract_feature_name(raw_requirement)
+        base_dir = Path(output_dir) if output_dir else Path.cwd() / "output"
+        review_dir = base_dir / f"_boost_review_{feature_name}_{timestamp}"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        return review_dir
 
     @staticmethod
     def _parse_json(text: str):
@@ -979,6 +1362,7 @@ Codex handoff was skipped by the review gate.
         try:
             if not skip_boost:
                 self.step_boost(raw_requirement)
+                self.step_review_boosted_requirement(raw_requirement, output_dir)
             else:
                 self.boosted_text = raw_requirement
 

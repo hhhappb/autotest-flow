@@ -11,7 +11,9 @@ The current release focuses on a two-mode QA workflow:
 - Inline mode provides a lightweight conversational draft of requirement analysis, test design, and implementation planning.
 - Pipeline mode persists the same workflow into auditable Markdown and JSON artifacts.
 - DeepSeek v4-pro handles requirement analysis and structured testing artifacts.
+- The pipeline pauses after requirement boosting so users can review or edit the boosted requirement before downstream artifacts are generated.
 - A review policy gate checks generated artifacts before code handoff.
+- Each pipeline run writes an offline `index.html` viewer for browsing Markdown and JSON artifacts in a browser.
 - Codex/GPT-5.5 receives a dedicated handoff package for project discovery, code-change planning, test implementation, execution, and repair.
 - The pipeline itself does not modify project code or run tests.
 
@@ -22,8 +24,10 @@ The current release focuses on a two-mode QA workflow:
 - Generates human-readable test plans.
 - Generates structured test cases in Markdown and JSON.
 - Produces automation implementation and execution requests.
+- Lets users approve or edit the boosted requirement before plan and case generation.
 - Reviews generated artifacts with `auto-review`, `ask`, or `full-auto` policies.
 - Generates Codex handoff artifacts for later code implementation.
+- Generates an offline HTML viewer for easier artifact review.
 - Keeps project code changes behind an explicit user confirmation gate.
 
 ## Inline vs Pipeline
@@ -33,7 +37,7 @@ The current release focuses on a two-mode QA workflow:
 | Mode | Best For | Output | Gate |
 |---|---|---|---|
 | Inline | Fast exploration, early requirement shaping, quick test design | Chat output: refined requirement, assumptions, test scope, test points, case table, implementation plan, confirmation questions | User confirmation before code edits |
-| Pipeline | Formal review, reusable artifacts, auditable handoff, regulated or shared workflows | Files: `boosted_requirement.md`, `test_plan.md`, `test_cases.md`, JSON artifacts, review notes, Codex handoff package | Review policy gate plus user confirmation before code edits |
+| Pipeline | Formal review, reusable artifacts, auditable handoff, regulated or shared workflows | Files: `boosted_requirement.md`, `test_plan.md`, `test_cases.md`, JSON artifacts, review notes, Codex handoff package, `index.html` viewer | Boosted requirement review, review policy gate, plus user confirmation before code edits |
 
 Inline minimum output:
 
@@ -50,6 +54,7 @@ Pipeline persists the same conceptual stages:
 ```text
 raw requirement
   -> boosted requirement
+  -> boosted requirement review/edit gate
   -> structured fields
   -> test plan
   -> test cases
@@ -129,6 +134,20 @@ cd skills\auto-test-flow\scripts
 python orchestrator.py "Test the login page, covering valid login, wrong password, empty account, duplicate submit, and permission denied scenarios"
 ```
 
+After the boost step, the pipeline creates a review folder containing:
+
+```text
+raw_requirement.txt
+boosted_requirement.md
+index.html
+```
+
+Review the boosted requirement before continuing:
+
+- Enter `yes` to continue with the current `boosted_requirement.md`.
+- Enter `edit` to edit `boosted_requirement.md`; save it, then return to the terminal and enter `yes`.
+- Enter `no` to stop before plan or test case generation.
+
 Save output to a specific directory:
 
 ```powershell
@@ -167,6 +186,7 @@ Each pipeline run creates a timestamped output directory:
 output/
   <feature>_<timestamp>/
     raw_requirement.txt
+    index.html
     boosted_requirement.md
     fields.json
     test_plan.md
@@ -181,6 +201,8 @@ output/
     codex_task.md
     report.md
 ```
+
+Open `index.html` in a browser to review the generated Markdown and JSON artifacts with navigation and table rendering.
 
 `codex_task.md` and `codex_task.json` are the handoff artifacts for Codex/GPT-5.5. Codex should read the project, propose a code-change plan, wait for user confirmation, and only then modify test code.
 
@@ -211,7 +233,9 @@ Release focus:
 
 - Clear Inline vs Pipeline mode definitions.
 - Inline-to-Pipeline promotion rules.
+- Boosted requirement review/edit gate before downstream generation.
 - Phase 2.6 pipeline orchestration.
+- Offline HTML artifact viewer.
 - DeepSeek-powered test analysis.
 - Review policy gate before Codex handoff.
 - Codex/GPT-5.5 implementation handoff artifacts.

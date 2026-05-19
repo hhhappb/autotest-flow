@@ -22,7 +22,7 @@ This skill supports two modes. Choose based on whether the user wants a quick de
 
 **Inline mode** (default, lightweight): Generate the refined requirement, test scope, test point breakdown, test case table, automation implementation plan, and need-confirmation questions directly in conversation. Fast, no files written. Good for quick exploration, early requirement shaping, or when the user wants to see the plan before creating files.
 
-**Pipeline mode** (persistent, auditable): Run the bundled `scripts/orchestrator.py` to produce standardized Markdown and JSON artifacts. The Phase 2.6 pipeline turns a rough requirement into a saved handoff package for later Codex/GPT-5.5 automation implementation and execution, with a review policy gate before Codex handoff. Use this when the user:
+**Pipeline mode** (persistent, auditable): Run the bundled `scripts/orchestrator.py` to produce standardized Markdown and JSON artifacts. The Phase 2.6 pipeline turns a rough requirement into a saved handoff package for later Codex/GPT-5.5 automation implementation and execution. After boosting the raw requirement, the pipeline pauses for the user to review or edit `boosted_requirement.md`; the confirmed boosted requirement becomes the source of truth for later artifacts. A separate review policy gate still runs before Codex handoff. Use this when the user:
 - Wants a saved `.md` test plan file for review/sharing
 - Needs intermediate artifacts (boosted requirement, structured fields JSON, structured cases JSON)
 - Asks for "输出文件" or "保存方案" or "生成文档"
@@ -114,7 +114,12 @@ The review gate checks for signals such as excessive test case scope, too many a
 
 Convert the user's raw request into a structured testing brief.
 
-**Pipeline mode**: Run the orchestrator script. It executes a Phase 2.6 pipeline (boost → extract fields → generate plan → generate cases → build automation request → build execution request → review gate → build Codex handoff → save report) via API and saves all artifacts as files.
+**Pipeline mode**: Run the orchestrator script. It executes a Phase 2.6 pipeline (boost → review/edit boosted requirement → extract fields → generate plan → generate cases → build automation request → build execution request → review gate → build Codex handoff → save report) via API and saves all artifacts as files.
+
+After boost, the script saves a review folder containing `raw_requirement.txt`, `boosted_requirement.md`, and `index.html`, then waits for confirmation:
+- Enter `yes`/`继续` to continue with the current boosted requirement.
+- Enter `edit`/`编辑` to edit `boosted_requirement.md`; save it, then return to the terminal and enter `yes`/`继续`.
+- Enter `no`/`取消` to stop before any downstream plan or test case generation.
 
 ```bash
 cd <skill-dir>/scripts

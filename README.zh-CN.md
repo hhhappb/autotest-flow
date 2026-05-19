@@ -11,7 +11,9 @@
 - Inline 模式用于在对话中快速产出需求分析、测试设计和实现计划草稿。
 - Pipeline 模式用于把同一套流程落盘成可审计的 Markdown 和 JSON 产物。
 - DeepSeek v4-pro 负责需求分析和结构化测试产物。
+- pipeline 会在需求增强后暂停，允许用户审查或编辑增强需求，再继续生成后续产物。
 - review policy gate 在交给 Codex 前审查生成结果。
+- 每次 pipeline 会生成离线 `index.html` 查看页，方便在浏览器中阅读 Markdown 和 JSON 产物。
 - Codex/GPT-5.5 接收专门的 handoff 任务包，负责项目发现、代码修改计划、测试实现、执行与修复。
 - pipeline 本身不会修改项目代码，也不会真实执行测试。
 
@@ -22,8 +24,10 @@
 - 生成可读的测试方案。
 - 生成 Markdown 和 JSON 两种形式的结构化测试用例。
 - 生成自动化实现请求和执行请求。
+- 在生成测试方案和用例前，允许用户确认或编辑增强后的需求。
 - 通过 `auto-review`、`ask`、`full-auto` 三种策略审查产物。
 - 生成 Codex handoff 产物，用于后续测试代码落地。
+- 生成离线 HTML 查看页，便于浏览器阅读产物。
 - 保留明确的用户确认 gate，避免未经确认修改项目代码。
 
 ## Inline 与 Pipeline
@@ -33,7 +37,7 @@
 | 模式 | 适合场景 | 输出形式 | 门禁 |
 |---|---|---|---|
 | Inline | 快速探索、早期需求澄清、快速测试设计 | 对话输出：增强需求、假设、测试范围、测试点、用例表、实现计划、待确认问题 | 修改代码前仍需用户确认 |
-| Pipeline | 正式评审、复用产物、审计留痕、多人交接 | 文件输出：`boosted_requirement.md`、`test_plan.md`、`test_cases.md`、JSON 产物、review notes、Codex handoff 包 | review policy gate + 修改代码前用户确认 |
+| Pipeline | 正式评审、复用产物、审计留痕、多人交接 | 文件输出：`boosted_requirement.md`、`test_plan.md`、`test_cases.md`、JSON 产物、review notes、Codex handoff 包、`index.html` 查看页 | 增强需求审查、review policy gate + 修改代码前用户确认 |
 
 Inline 最少应该输出：
 
@@ -50,6 +54,7 @@ Pipeline 会把同一套概念流程持久化：
 ```text
 原始需求
   -> 增强需求
+  -> 增强需求审查/编辑 gate
   -> 结构化字段
   -> 测试方案
   -> 测试用例
@@ -129,6 +134,20 @@ cd skills\auto-test-flow\scripts
 python orchestrator.py "测试登录页面，覆盖正确账号登录、错误密码、账号为空、重复提交和权限不足场景"
 ```
 
+boost 步骤结束后，pipeline 会先生成一个审查目录：
+
+```text
+raw_requirement.txt
+boosted_requirement.md
+index.html
+```
+
+请先审查增强后的需求，再决定是否继续：
+
+- 输入 `yes` 或 `继续`：使用当前 `boosted_requirement.md` 继续。
+- 输入 `edit` 或 `编辑`：先编辑 `boosted_requirement.md`，保存后回到终端输入 `yes` 或 `继续`。
+- 输入 `no` 或 `取消`：在生成测试方案和用例前停止。
+
 指定输出目录：
 
 ```powershell
@@ -167,6 +186,7 @@ python orchestrator.py "测试登录页面" --review-policy full-auto
 output/
   <feature>_<timestamp>/
     raw_requirement.txt
+    index.html
     boosted_requirement.md
     fields.json
     test_plan.md
@@ -181,6 +201,8 @@ output/
     codex_task.md
     report.md
 ```
+
+可以在浏览器中打开 `index.html`，用导航和表格渲染查看生成的 Markdown / JSON 产物。
 
 `codex_task.md` 和 `codex_task.json` 是交给 Codex/GPT-5.5 的任务包。Codex 应先读取项目、提出代码修改计划、等待用户确认，然后才能修改测试代码。
 
@@ -211,7 +233,9 @@ output/
 
 - 明确 Inline 与 Pipeline 的模式差异。
 - 增加 Inline 晋升 Pipeline 的规则。
+- 增加增强需求审查/编辑 gate，避免 boost 后直接生成下游产物。
 - Phase 2.6 pipeline 编排。
+- 增加离线 HTML 产物查看页。
 - 基于 DeepSeek 的测试分析。
 - Codex handoff 前的 review policy gate。
 - 面向 Codex/GPT-5.5 的代码落地交接产物。
