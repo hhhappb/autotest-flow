@@ -10,21 +10,21 @@ def build_html_viewer(run_dir: Path) -> str:
     """Build an offline HTML viewer for generated Markdown and JSON artifacts."""
     files = [
         ("报告", "md/report.md", "markdown"),
+        ("交接审查", "md/review_notes.md", "markdown"),
         ("需求上下文", "md/requirement.md", "markdown"),
         ("测试方案", "md/test_plan.md", "markdown"),
         ("测试用例", "md/test_cases.md", "markdown"),
-        ("审查说明", "md/review_notes.md", "markdown"),
         ("Excel 用例", "exports/test_cases.xlsx", "download"),
         ("XMind 用例", "exports/test_cases.xmind", "download"),
     ]
 
     nav_items = []
     sections = []
-    for index, (title, filename, kind) in enumerate(files, start=1):
+    for title, filename, kind in files:
         path = run_dir / filename
         if not path.exists():
             continue
-        section_id = f"doc-{index}"
+        section_id = _section_id(filename)
         nav_items.append(
             f'<a href="#{section_id}"><span>{html.escape(title)}</span><small>{html.escape(filename)}</small></a>'
         )
@@ -347,6 +347,9 @@ def _render_table(lines: list[str]) -> str:
 
 def _split_table_row(line: str) -> list[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+def _section_id(filename: str) -> str:
+    return "doc-" + re.sub(r"[^a-zA-Z0-9]+", "-", filename).strip("-").lower()
 
 def render_inline(text: str) -> str:
     escaped = html.escape(text)

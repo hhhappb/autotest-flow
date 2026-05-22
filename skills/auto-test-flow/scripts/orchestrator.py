@@ -31,6 +31,17 @@ from datetime import datetime
 from pathlib import Path
 
 from exporters import write_test_cases_xlsx, write_test_cases_xmind
+from project_discovery import (
+    build_project_context_discovery_markdown,
+    discover_project_context,
+)
+from review import (
+    build_review_notes_markdown,
+    build_review_result,
+    build_review_summary,
+    prompt_for_review_confirmation,
+    should_build_codex_handoff,
+)
 from viewer import build_html_viewer
 
 from config import (
@@ -44,48 +55,14 @@ from templates.test_plan_prompt import (
     AUTOMATION_REQUEST_JSON_SYSTEM_PROMPT,
     CODEX_HANDOFF_REQUIREMENTS,
     EXECUTION_REQUEST_JSON_SYSTEM_PROMPT,
-    REVIEW_POLICY_GUIDE,
+    EXTRACT_FIELDS_SYSTEM_PROMPT,
+    INTAKE_VALIDATION_SYSTEM_PROMPT,
     TEST_CASES_JSON_SYSTEM_PROMPT,
     TEST_PLAN_SYSTEM_PROMPT,
 )
 
 
 REVIEW_POLICIES = ("ask", "auto-review", "full-auto")
-
-
-EXTRACT_FIELDS_SYSTEM_PROMPT = """你是一个需求分析师。请从以下测试需求上下文中，提取出关键字段。
-返回纯JSON格式（不要带```json标记），包含以下字段：
-{
-    "test_object": "测试对象说明",
-    "business_context": "业务背景说明",
-    "core_requirements": "核心需求列表，用换行符分隔",
-    "user_roles": "用户角色列表，用换行符分隔",
-    "input_conditions": "输入条件列表，用换行符分隔",
-    "expected_results": "预期结果说明",
-    "exception_scenarios": "异常情况列表，用换行符分隔"
-}"""
-
-
-INTAKE_VALIDATION_SYSTEM_PROMPT = """你是自动化测试需求 intake 审查员。你的任务不是扩写需求，而是判断用户输入和附件摘要中是否能识别出一个可用于生成测试计划/测试用例的测试点。
-
-请只返回纯 JSON，不要输出 markdown，不要输出 ```json。
-
-返回格式：
-{
-  "status": "ready 或 needs_clarification",
-  "normalized_requirement": "当 status=ready 时，基于用户输入和材料摘要整理出保守的需求上下文；不要编造页面、账号、步骤、预期",
-  "reason": "简短原因",
-  "questions": ["当 status=needs_clarification 时，列出需要用户补充的问题"]
-}
-
-判定规则：
-- 这是“生成测试计划/测试用例”的入口，不是“直接写自动化代码”的入口；不要用代码实现所需的严格程度来阻断用例生成。
-- 只要能从用户输入或附件摘要中识别出测试对象/系统/模块/功能点，并能找到相关测试说明、URL、规则、场景、状态、预期倾向或测试点描述，就返回 ready。
-- 如果用户说“根据文档/表格里的某功能点生成测试用例”，且附件摘要里存在对应功能点行或相关上下文，应返回 ready；缺少的细节放到后续 need_confirmation，不要在 intake 阶段阻断。
-- 如果只是数字、编号、单词、泛泛一句话、只有“测试一下”，且附件摘要也无法定位测试对象或测试点，则返回 needs_clarification。
-- 如果缺少关键信息但仍能生成测试用例草案，返回 ready，并把缺失信息写入 normalized_requirement 的“待确认”部分。
-- 不要为了继续流程而猜测业务背景、页面元素、选择器、账号、团队、环境、预期结果。
-"""
 
 
 class TestWorkflowOrchestrator:
@@ -127,6 +104,15 @@ class TestWorkflowOrchestrator:
             if hasattr(block, "text"):
                 return block.text
         raise ValueError(f"No text block in response: {response.content}")
+
+    def _step_call_api(self, label: str, system_prompt: str, user_message: str,
+                       temperature: float, max_tokens: int, result_key: str) -> dict:
+        """Print header, call API, parse JSON, return dict -- used by steps 1/4/5/6."""
+        print("=" * 60)
+        print(f"[{label}] ...")
+        print("=" * 60)
+        raw = self._call_api(system_prompt, user_message, temperature, max_tokens)
+        return self._ensure_dict(self._parse_json(raw), result_key)
 
     def step_validate_intake(self, raw_requirement: str) -> str:
         """Step 0: Ask the model whether the input is actionable enough."""
@@ -170,18 +156,11 @@ class TestWorkflowOrchestrator:
 
     # ═══ Step 1: Extract Fields ═══
     def step_extract_fields(self) -> dict:
-        """Step 1: Extract structured fields from validated requirement context."""
-        print("=" * 60)
-        print("[Step 1/9] 提取结构化字段...")
-        print("=" * 60)
-
-        fields_json = self._call_api(
-            system_prompt=EXTRACT_FIELDS_SYSTEM_PROMPT,
-            user_message=f"请从以下测试需求中提取字段：\n\n{self.requirement_text}",
-            temperature=0.2,
-            max_tokens=2048,
-        )
-        self.fields = self._ensure_dict(self._parse_json(fields_json), "fields")
+        self.fields = self._step_call_api(
+            "Step 1/9 提取结构化字段",
+            EXTRACT_FIELDS_SYSTEM_PROMPT,
+            f"请从以下测试需求中提取字段：\n\n{self.requirement_text}",
+            0.2, 2048, "fields")
         print(json.dumps(self.fields, ensure_ascii=False, indent=2))
         return self.fields
 
@@ -191,32 +170,15 @@ class TestWorkflowOrchestrator:
         print("[Step 2/9] Discovering existing project context...")
         print("=" * 60)
 
-        project_root = self._select_project_root(raw_requirement)
-        if not project_root:
-            self.project_context_discovery = {
-                "status": "not_found",
-                "project_root": None,
-                "framework_signals": [],
-                "relevant_files": [],
-                "key_snippets": [],
-                "recommended_commands": [],
-                "hard_constraints": [
-                    "No local project root was discovered before artifact generation.",
-                    "Downstream artifacts must ask Codex to inspect the repository before proposing files, classes, selectors, fixtures, or commands.",
-                    "Do not invent project paths, page objects, selectors, fixtures, or execution commands.",
-                ],
-                "forbidden_patterns": [],
-                "notes": [
-                    "Provide a concrete project path in the requirement for stronger project-aware generation.",
-                ],
-            }
+        self.project_context_discovery = discover_project_context(
+            raw_requirement=raw_requirement,
+            requirement_text=self.requirement_text,
+            fields=self.fields,
+            cwd=Path.cwd(),
+        )
+        if self.project_context_discovery.get("status") == "not_found":
             print("No project root discovered; downstream prompts will require repository inspection.")
             return self.project_context_discovery
-
-        self.project_context_discovery = self._collect_project_context(
-            project_root=project_root,
-            raw_requirement=raw_requirement,
-        )
         print(json.dumps({
             "status": self.project_context_discovery.get("status"),
             "project_root": self.project_context_discovery.get("project_root"),
@@ -244,58 +206,31 @@ class TestWorkflowOrchestrator:
 
     # ═══ Step 4: Generate Structured Test Cases ═══
     def step_generate_test_cases(self) -> dict:
-        """Step 4: Generate machine-readable and markdown-ready test cases."""
-        print("=" * 60)
-        print("[Step 4/9] 生成结构化测试用例...")
-        print("=" * 60)
-
-        cases_json = self._call_api(
-            system_prompt=TEST_CASES_JSON_SYSTEM_PROMPT,
-            user_message=self._build_test_cases_user_prompt(),
-            temperature=PLAN_TEMPERATURE,
-            max_tokens=PLAN_MAX_TOKENS,
-        )
-        self.test_cases = self._ensure_dict(self._parse_json(cases_json), "test_cases")
+        self.test_cases = self._step_call_api(
+            "Step 4/9 生成结构化测试用例",
+            TEST_CASES_JSON_SYSTEM_PROMPT,
+            self._build_test_cases_user_prompt(),
+            PLAN_TEMPERATURE, PLAN_MAX_TOKENS, "test_cases")
         print(f"生成用例数量: {len(self.test_cases.get('cases', []))}")
         return self.test_cases
 
     # ═══ Step 5: Build Automation Request ═══
     def step_build_automation_request(self) -> dict:
-        """Step 5: Generate an automation implementation request, not code."""
-        print("=" * 60)
-        print("[Step 5/9] 生成自动化脚本实现请求...")
-        print("=" * 60)
-
-        request_json = self._call_api(
-            system_prompt=AUTOMATION_REQUEST_JSON_SYSTEM_PROMPT,
-            user_message=self._build_automation_request_prompt(),
-            temperature=0.2,
-            max_tokens=4096,
-        )
-        self.automation_request = self._ensure_dict(
-            self._parse_json(request_json),
-            "automation_request",
-        )
+        self.automation_request = self._step_call_api(
+            "Step 5/9 生成自动化脚本实现请求",
+            AUTOMATION_REQUEST_JSON_SYSTEM_PROMPT,
+            self._build_automation_request_prompt(),
+            0.2, 4096, "automation_request")
         print(json.dumps(self.automation_request, ensure_ascii=False, indent=2)[:800])
         return self.automation_request
 
     # ═══ Step 6: Build Execution Request ═══
     def step_build_execution_request(self) -> dict:
-        """Step 6: Generate a future execution request, not a test run."""
-        print("=" * 60)
-        print("[Step 6/9] 生成执行请求...")
-        print("=" * 60)
-
-        request_json = self._call_api(
-            system_prompt=EXECUTION_REQUEST_JSON_SYSTEM_PROMPT,
-            user_message=self._build_execution_request_prompt(),
-            temperature=0.2,
-            max_tokens=4096,
-        )
-        self.execution_request = self._ensure_dict(
-            self._parse_json(request_json),
-            "execution_request",
-        )
+        self.execution_request = self._step_call_api(
+            "Step 6/9 生成执行请求",
+            EXECUTION_REQUEST_JSON_SYSTEM_PROMPT,
+            self._build_execution_request_prompt(),
+            0.2, 4096, "execution_request")
         print(json.dumps(self.execution_request, ensure_ascii=False, indent=2)[:800])
         return self.execution_request
 
@@ -306,11 +241,17 @@ class TestWorkflowOrchestrator:
         print(f"[Step 7/9] 审查生成产物 (policy: {self.review_policy})...")
         print("=" * 60)
 
-        self.review_result = self._build_review_result()
-        print(self._build_review_summary())
+        self.review_result = build_review_result(
+            test_cases=self.test_cases,
+            automation_request=self.automation_request,
+            execution_request=self.execution_request,
+            project_context_discovery=self.project_context_discovery,
+            review_policy=self.review_policy,
+        )
+        print(build_review_summary(self.review_result))
 
         if self.review_policy == "ask":
-            self._prompt_for_review_confirmation()
+            prompt_for_review_confirmation(self.review_result)
         elif self.review_policy == "auto-review" and self.review_result.get("decision") == "blocked":
             print("\n[REVIEW] Auto-review 已阻塞 Codex handoff，将保存审查结果后停止交接生成。")
 
@@ -362,14 +303,14 @@ class TestWorkflowOrchestrator:
         self._write_json(json_dir / "test_cases.json", self.test_cases)
         self._write_json(json_dir / "execution_request.json", self.execution_request)
         self._write_json(json_dir / "review_result.json", self.review_result)
-        self._write_text(md_dir / "review_notes.md", self._build_review_notes_markdown())
+        self._write_text(md_dir / "review_notes.md", build_review_notes_markdown(self.review_result, self.test_cases))
 
         if full_artifacts:
             self._write_json(full_dir / "fields.json", self.fields)
             self._write_json(full_dir / "project_context_discovery.json", self.project_context_discovery)
-            self._write_text(full_dir / "project_context_discovery.md", self._build_project_context_discovery_markdown())
+            self._write_text(full_dir / "project_context_discovery.md", build_project_context_discovery_markdown(self.project_context_discovery))
             self._write_json(full_dir / "review_result.json", self.review_result)
-            self._write_text(full_dir / "review_notes.md", self._build_review_notes_markdown())
+            self._write_text(full_dir / "review_notes.md", build_review_notes_markdown(self.review_result, self.test_cases))
             self._write_json(full_dir / "project_context_request.json", self.project_context_request)
             self._write_json(full_dir / "codex_task.json", self.codex_task)
 
@@ -400,6 +341,7 @@ class TestWorkflowOrchestrator:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    @staticmethod
     def _extract_feature_name(text: str, max_len: int = 20) -> str:
         """Extract a short feature name from the raw requirement."""
         name = text.strip().split("\n")[0].strip()
@@ -408,374 +350,6 @@ class TestWorkflowOrchestrator:
                 name = name[len(prefix):]
         name = re.sub(r"[^\u4e00-\u9fff\w]", "_", name)
         return name[:max_len].strip("_") or "test_plan"
-
-    def _select_project_root(self, raw_requirement: str) -> Path | None:
-        """Pick the strongest local project root candidate without using the API."""
-        candidates = []
-        source_text = "\n".join([
-            raw_requirement or "",
-            self.requirement_text or "",
-            json.dumps(self.fields, ensure_ascii=False),
-        ])
-
-        candidates.extend(self._extract_path_candidates(source_text))
-
-        cwd = Path.cwd()
-        for base in [cwd, *cwd.parents]:
-            candidates.append(base / "auto-test")
-            candidates.append(base)
-
-        seen = set()
-        scored = []
-        for candidate in candidates:
-            root = self._normalize_project_root(candidate)
-            if not root:
-                continue
-            key = str(root).lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            score = self._score_project_root(root)
-            if score > 0:
-                scored.append((score, root))
-
-        if not scored:
-            return None
-        scored.sort(key=lambda item: (item[0], len(str(item[1]))), reverse=True)
-        return scored[0][1]
-
-    def _extract_path_candidates(self, text: str) -> list[Path]:
-        """Extract Windows path candidates and trim natural-language suffixes."""
-        candidates = []
-        for match in re.finditer(r"[A-Za-z]:\\[^\r\n\"'<>|]+", text or ""):
-            raw_candidate = match.group(0).strip().rstrip(".,;:，。；：)）]")
-            resolved = self._longest_existing_path_prefix(raw_candidate)
-            if resolved:
-                candidates.append(resolved)
-            else:
-                candidates.append(Path(raw_candidate))
-        return candidates
-
-    @staticmethod
-    def _longest_existing_path_prefix(raw_path: str) -> Path | None:
-        """Return the longest existing prefix from a path-like string."""
-        cleaned = raw_path.strip().rstrip(".,;:，。；：)）]")
-        if not cleaned:
-            return None
-        try:
-            if Path(cleaned).exists():
-                return Path(cleaned)
-        except OSError:
-            pass
-
-        min_len = 3  # e.g. C:\
-        for end in range(len(cleaned) - 1, min_len - 1, -1):
-            prefix = cleaned[:end].strip().rstrip(".,;:，。；：)）]")
-            if len(prefix) < min_len:
-                continue
-            try:
-                if Path(prefix).exists():
-                    return Path(prefix)
-            except OSError:
-                continue
-        return None
-
-    @staticmethod
-    def _normalize_project_root(path: Path) -> Path | None:
-        try:
-            if not path.exists():
-                return None
-            current = path if path.is_dir() else path.parent
-            markers = {
-                "pytest.ini",
-                "pyproject.toml",
-                "package.json",
-                "pom.xml",
-                "build.gradle",
-                "project",
-                "tests",
-                "src",
-            }
-            for candidate in [current, *current.parents]:
-                if any((candidate / marker).exists() for marker in markers):
-                    return candidate.resolve()
-            return current.resolve()
-        except OSError:
-            return None
-
-    @staticmethod
-    def _score_project_root(root: Path) -> int:
-        score = 0
-        marker_weights = {
-            "pytest.ini": 6,
-            "pyproject.toml": 5,
-            "package.json": 5,
-            "conftest.py": 4,
-            "runner.py": 3,
-            "project": 4,
-            "tests": 3,
-            "src": 2,
-        }
-        for marker, weight in marker_weights.items():
-            if (root / marker).exists():
-                score += weight
-        if root.name.lower() == "auto-test":
-            score += 8
-        if (root / "project" / "feikua").exists():
-            score += 8
-        return score
-
-    def _collect_project_context(self, project_root: Path, raw_requirement: str) -> dict:
-        terms = self._derive_discovery_terms(raw_requirement)
-        framework_signals = self._discover_framework_signals(project_root)
-        relevant_files = self._find_relevant_files(project_root, terms)
-        snippets = [
-            self._build_file_snippet(project_root / item["path"], terms)
-            for item in relevant_files[:10]
-        ]
-        snippets = [item for item in snippets if item]
-        recommended_commands = self._infer_recommended_commands(project_root, relevant_files)
-        hard_constraints, forbidden_patterns, notes = self._infer_project_constraints(
-            project_root=project_root,
-            relevant_files=relevant_files,
-            terms=terms,
-        )
-        return {
-            "status": "discovered",
-            "project_root": str(project_root),
-            "framework_signals": framework_signals,
-            "relevant_files": relevant_files[:20],
-            "key_snippets": snippets,
-            "recommended_commands": recommended_commands,
-            "hard_constraints": hard_constraints,
-            "forbidden_patterns": forbidden_patterns,
-            "notes": notes,
-        }
-
-    def _derive_discovery_terms(self, raw_requirement: str) -> list[str]:
-        source = "\n".join([
-            raw_requirement or "",
-            self.requirement_text or "",
-            json.dumps(self.fields, ensure_ascii=False),
-        ]).lower()
-        terms = set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}", source))
-        terms.update(re.findall(r"[\u4e00-\u9fff]{2,}", source))
-
-        if any(token in source for token in ["finger", "fingerprint", "finger_print", "指纹"]):
-            terms.update([
-                "finger",
-                "fingerprint",
-                "finger_print",
-                "指纹",
-                "screen",
-                "timezone",
-                "language",
-                "cpu",
-                "device",
-                "device_memory",
-                "deviceMemory",
-                "browser",
-                "store",
-            ])
-        if "screen" in source or "屏幕" in source:
-            terms.update(["screen", "屏幕"])
-        if "timezone" in source or "时区" in source:
-            terms.update(["timezone", "时区"])
-        if "language" in source or "语言" in source:
-            terms.update(["language", "语言"])
-
-        noisy = {"the", "and", "for", "with", "this", "that", "json", "true", "false"}
-        return sorted(term for term in terms if term not in noisy)
-
-    @staticmethod
-    def _discover_framework_signals(project_root: Path) -> list[dict]:
-        signal_names = [
-            "pytest.ini",
-            "conftest.py",
-            "requirements.txt",
-            "requirements",
-            "pyproject.toml",
-            "package.json",
-            "playwright.config.ts",
-            "playwright.config.js",
-            "cypress.config.ts",
-            "cypress.config.js",
-            "runner.py",
-        ]
-        signals = []
-        for name in signal_names:
-            path = project_root / name
-            if path.exists():
-                signals.append({"path": name, "type": "file" if path.is_file() else "directory"})
-        return signals
-
-    def _find_relevant_files(self, project_root: Path, terms: list[str]) -> list[dict]:
-        scored_files = []
-        allowed_suffixes = {".py", ".js", ".ts", ".tsx", ".jsx", ".md", ".json", ".ini", ".toml", ".yaml", ".yml"}
-        ignored_parts = {
-            ".git",
-            ".venv",
-            "venv",
-            "node_modules",
-            "__pycache__",
-            ".pytest_cache",
-            "allure-results",
-            "allure-report",
-            "logs",
-            "output",
-            "report",
-            "reports",
-            "testreport",
-            "dist",
-            "build",
-        }
-
-        for path in self._iter_project_files(project_root):
-            relative = path.relative_to(project_root)
-            parts = {part.lower() for part in relative.parts}
-            if parts & ignored_parts:
-                continue
-            if path.suffix.lower() not in allowed_suffixes:
-                continue
-            rel_text = str(relative).replace("\\", "/").lower()
-            score = 0
-            matched = set()
-            for term in terms:
-                lowered = term.lower()
-                if lowered and lowered in rel_text:
-                    score += 8
-                    matched.add(term)
-            if score == 0:
-                score += self._score_file_content(path, terms, matched)
-            else:
-                score += self._score_file_content(path, terms, matched)
-            if score:
-                scored_files.append({
-                    "path": str(relative).replace("\\", "/"),
-                    "score": score,
-                    "matched_terms": sorted(matched)[:12],
-                })
-
-        scored_files.sort(key=lambda item: (item["score"], -len(item["path"])), reverse=True)
-        return scored_files
-
-    @staticmethod
-    def _iter_project_files(project_root: Path):
-        try:
-            for path in project_root.rglob("*"):
-                if path.is_file():
-                    yield path
-        except OSError:
-            return
-
-    @staticmethod
-    def _score_file_content(path: Path, terms: list[str], matched: set) -> int:
-        try:
-            if path.stat().st_size > 250_000:
-                return 0
-            text = path.read_text(encoding="utf-8", errors="ignore").lower()
-        except OSError:
-            return 0
-        score = 0
-        for term in terms:
-            lowered = term.lower()
-            if lowered and lowered in text:
-                count = min(text.count(lowered), 5)
-                score += count
-                matched.add(term)
-        return score
-
-    @staticmethod
-    def _build_file_snippet(path: Path, terms: list[str]) -> dict | None:
-        try:
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            return None
-        term_lowers = [term.lower() for term in terms if term]
-        matched_indexes = []
-        matched_terms = set()
-        for index, line in enumerate(lines):
-            lowered = line.lower()
-            line_terms = [term for term in term_lowers if term in lowered]
-            if line_terms:
-                matched_indexes.append(index)
-                matched_terms.update(line_terms[:6])
-            if len(matched_indexes) >= 6:
-                break
-
-        if not matched_indexes:
-            selected_indexes = range(0, min(len(lines), 35))
-        else:
-            indexes = set()
-            for index in matched_indexes[:4]:
-                indexes.update(range(max(0, index - 2), min(len(lines), index + 3)))
-            selected_indexes = sorted(indexes)[:50]
-
-        snippet_lines = [
-            f"{index + 1}: {lines[index]}"
-            for index in selected_indexes
-        ]
-        return {
-            "path": str(path),
-            "matched_terms": sorted(matched_terms)[:12],
-            "snippet": "\n".join(snippet_lines),
-        }
-
-    @staticmethod
-    def _infer_recommended_commands(project_root: Path, relevant_files: list[dict]) -> list[str]:
-        commands = []
-        relevant_paths = [item.get("path", "") for item in relevant_files]
-        fingerprint_test = "project/feikua/testcases/test_finger_print.py"
-        if fingerprint_test in relevant_paths:
-            commands.append(
-                r"venv\Scripts\python.exe -m pytest project\feikua\testcases\test_finger_print.py::TestFingerPrintCompare::test_compare_browser_and_store_fingerprints -q --reruns 0"
-            )
-        elif (project_root / "pytest.ini").exists():
-            first_test = next((path for path in relevant_paths if path.endswith(".py") and "/test" in path), None)
-            if first_test:
-                first_test_windows = first_test.replace("/", "\\")
-                commands.append(fr"venv\Scripts\python.exe -m pytest {first_test_windows} -q")
-            else:
-                commands.append(r"venv\Scripts\python.exe -m pytest -q")
-        if (project_root / "package.json").exists():
-            commands.append("npm test")
-        return commands
-
-    @staticmethod
-    def _infer_project_constraints(project_root: Path, relevant_files: list[dict],
-                                   terms: list[str]) -> tuple[list[str], list[str], list[str]]:
-        relevant_paths = {item.get("path", "") for item in relevant_files}
-        hard_constraints = [
-            "Treat project_context_discovery as the source of truth for file layout, framework, and execution commands.",
-            "Prefer existing files, page objects, selectors, fixtures, helpers, naming, and assertion style over introducing new structure.",
-            "Do not propose new files, classes, selectors, fixtures, or commands that conflict with discovered project files.",
-        ]
-        forbidden_patterns = []
-        notes = []
-        term_text = " ".join(terms).lower()
-
-        if "finger" in term_text or "fingerprint" in term_text or "finger_print" in term_text or "指纹" in term_text:
-            if "project/feikua/testcases/test_finger_print.py" in relevant_paths:
-                hard_constraints.append("Reuse project/feikua/testcases/test_finger_print.py for fingerprint automation unless the user explicitly approves a new test file.")
-            if "project/feikua/pages/login_page/finger_print_page/finger_print_page.py" in relevant_paths:
-                hard_constraints.append("Reuse FingerPrintPage in project/feikua/pages/login_page/finger_print_page/finger_print_page.py for fingerprint page operations.")
-            if "project/feikua/selectors/finger_print_selectors.py" in relevant_paths:
-                hard_constraints.append("Reuse and extend FingerprintSelectors in project/feikua/selectors/finger_print_selectors.py for fingerprint locators.")
-            hard_constraints.append("Preserve existing fingerprint assertion logic: enabled spoofing means store value differs from the real browser; disabled spoofing means store value equals the real browser.")
-            hard_constraints.append("Keep first implementation scoped to screen, timezone, and language unless the confirmed requirement expands scope.")
-            forbidden_patterns.extend([
-                "ShopEditPage",
-                "test_fingerprint_screen_timezone_language.py",
-                "pytest tests/",
-                "new fixture",
-                "new selector file",
-            ])
-            notes.append("Fingerprint-specific constraints were inferred from discovered feikua fingerprint files.")
-
-        if not relevant_files:
-            notes.append("No relevant files matched the requirement terms; downstream artifacts must request more project inspection.")
-
-        return hard_constraints, forbidden_patterns, notes
 
     def _project_context_prompt(self) -> str:
         if not self.project_context_discovery:
@@ -786,48 +360,6 @@ If a requested file/class/fixture/command conflicts with discovery, prefer disco
 Do not invent files, classes, selectors, fixtures, or execution commands that conflict with this context.
 
 {self._json_block(self.project_context_discovery)}"""
-
-    def _build_project_context_discovery_markdown(self) -> str:
-        context = self.project_context_discovery or {}
-        lines = [
-            "# Project Context Discovery",
-            "",
-            f"- Status: {context.get('status', 'not_run')}",
-            f"- Project root: {context.get('project_root') or 'not discovered'}",
-            "",
-            "## Framework Signals",
-        ]
-        signals = context.get("framework_signals", [])
-        lines.extend(self._markdown_bullets(
-            f"{item.get('path')} ({item.get('type')})" for item in signals
-        ))
-        lines.extend(["", "## Relevant Files"])
-        lines.extend(self._markdown_bullets(
-            f"{item.get('path')} - score {item.get('score')} - matched: {', '.join(item.get('matched_terms', []))}"
-            for item in context.get("relevant_files", [])
-        ))
-        lines.extend(["", "## Recommended Commands"])
-        lines.extend(self._markdown_bullets(context.get("recommended_commands", [])))
-        lines.extend(["", "## Hard Constraints"])
-        lines.extend(self._markdown_bullets(context.get("hard_constraints", [])))
-        lines.extend(["", "## Key Snippets"])
-        for snippet in context.get("key_snippets", []):
-            lines.extend([
-                "",
-                f"### {snippet.get('path')}",
-                "",
-                "```text",
-                snippet.get("snippet", ""),
-                "```",
-            ])
-        return "\n".join(lines)
-
-    @staticmethod
-    def _markdown_bullets(items) -> list[str]:
-        values = [str(item) for item in items if item]
-        if not values:
-            return ["- None"]
-        return [f"- {item}" for item in values]
 
     @staticmethod
     def _parse_json(text: str):
@@ -900,8 +432,9 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 要求：
 1. 项目上下文发现是文件结构、框架、已有测试逻辑和执行命令的事实来源。
 2. 测试方案必须复用已有测试结构，不能臆造与项目上下文冲突的页面对象、选择器、fixture、测试文件或命令。
-3. 如果输入材料已经明确给出测试点或测试用例，只围绕这些已明确内容输出；用户只指定其中一个功能点时，不要展开同一材料中的其他功能点。
-4. 如果需求与已有代码逻辑存在不确定点，请写入待确认问题，不要把假设写成确定预期。"""
+3. 如果输入材料已经明确给出测试点或测试用例，这些内容就是唯一测试范围；只做结构化整理，不额外扩写异常、边界、权限、安全或兼容性场景。
+4. 如果材料中一行只表达一个测试点，默认只对应一个用例；用户只指定其中一个功能点时，不要展开同一材料中的其他功能点。
+5. 如果需求与已有代码逻辑存在不确定点，请写入待确认问题，不要把假设写成确定预期。"""
 
     def _build_test_cases_user_prompt(self) -> str:
         """Build a project-aware user prompt for structured test cases."""
@@ -919,8 +452,11 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 要求：
 1. 用例预期必须以项目上下文和已有代码逻辑为准。
 2. 不要因为常见直觉推翻已有测试逻辑；如果与直觉冲突，把原因写入 assumptions 或 need_confirmation。
-3. 如果输入材料已经明确给出测试点或测试用例，只生成这些已明确范围内的用例；不要扩展未指定功能点。
-4. 不要输出要求新增未知测试文件、未知页面对象、未知 fixture 的用例前置条件。"""
+3. 如果输入材料已经明确给出测试点或测试用例，把它们视为唯一事实来源，只生成这些已明确范围内的用例；不要扩展未指定功能点。
+4. 如果材料中一行只表达一个测试点，默认只生成一个对应用例；除非该行本身明确包含多个场景。
+5. 不要主动新增异常、边界、权限、安全、兼容性、容错或回归场景；只有材料或用户明确要求时才生成。
+6. 如果信息缺失，写入 need_confirmation，不要通过新增用例来补全。
+7. 不要输出要求新增未知测试文件、未知页面对象、未知 fixture 的用例前置条件。"""
 
     def _build_automation_request_prompt(self) -> str:
         """Build a project-aware automation handoff prompt."""
@@ -963,189 +499,13 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 1. 优先使用 project_context_discovery.recommended_commands。
 2. 不要输出通用的 pytest tests/、npm test 等命令，除非项目上下文明确支持。
 3. 如果执行前需要登录账号、浏览器进程、环境变量或测试数据，写入 pre_run_checks。
-4. 如果 automation_request.element_evidence_required 为 true，将“确认已完成 CDP/F12 元素证据采集”写入 pre_run_checks。"""
-
-    def _build_review_result(self) -> dict:
-        """Review artifacts with deterministic risk rules before Codex handoff."""
-        findings = []
-        cases = self.test_cases.get("cases", [])
-        selected_cases = self.automation_request.get("selected_cases", [])
-        context_needed = self.automation_request.get("project_context_needed", [])
-        required_environment = self.execution_request.get("required_environment", [])
-        pre_run_checks = self.execution_request.get("pre_run_checks", [])
-
-        if isinstance(selected_cases, str):
-            selected_cases = [selected_cases]
-        if isinstance(context_needed, str):
-            context_needed = [context_needed]
-
-        generated_text = json.dumps({
-            "test_cases": self.test_cases,
-            "automation_request": self.automation_request,
-            "execution_request": self.execution_request,
-        }, ensure_ascii=False)
-        for pattern in self.project_context_discovery.get("forbidden_patterns", []):
-            if pattern and pattern.lower() in generated_text.lower():
-                findings.append(self._finding(
-                    "high",
-                    "project_context_conflict",
-                    f"Generated artifact conflicts with project discovery forbidden pattern: {pattern}",
-                    "Regenerate or edit the artifact so it follows project_context_discovery.hard_constraints and existing project structure.",
-                ))
-
-        if self.project_context_discovery.get("status") == "discovered":
-            command_values = []
-            for command_field in ("commands", "command_candidates"):
-                value = self.execution_request.get(command_field, [])
-                if isinstance(value, str):
-                    command_values.append(value)
-                elif isinstance(value, list):
-                    command_values.extend(str(item) for item in value)
-            commands_text = "\n".join(command_values)
-            if "pytest tests/" in commands_text.replace("\\", "/"):
-                findings.append(self._finding(
-                    "high",
-                    "execution_command_conflict",
-                    "Execution request uses a generic pytest tests/ command even though project discovery found a concrete project layout.",
-                    "Use project_context_discovery.recommended_commands or an explicitly discovered project test path.",
-                ))
-
-        if len(cases) > 12:
-            findings.append(self._finding(
-                "medium",
-                "case_scope",
-                f"结构化测试用例数量为 {len(cases)}，可能超过首批自动化落地范围。",
-                "建议人工删减或调整 P0/P1 自动化候选用例。",
-            ))
-
-        if len(selected_cases) > 8:
-            findings.append(self._finding(
-                "medium",
-                "automation_scope",
-                f"首批自动化候选用例数量为 {len(selected_cases)}，可能导致一次落地范围过大。",
-                "建议优先保留核心 P0 和少量关键 P1。",
-            ))
-
-        if len(context_needed) > 8:
-            findings.append(self._finding(
-                "medium",
-                "project_context",
-                "自动化实现请求需要大量项目上下文，说明当前上下文不够确定。",
-                "Codex 写代码前应先做项目发现，并输出修改计划。",
-            ))
-
-        recommended_framework = str(self.automation_request.get("recommended_framework", ""))
-        if recommended_framework and recommended_framework not in ("existing_project_framework", "待项目发现"):
-            findings.append(self._finding(
-                "medium",
-                "framework_choice",
-                f"自动化请求推荐了框架：{recommended_framework}",
-                "如果项目已有测试框架，应优先使用已有框架。",
-            ))
-
-        target_type = str(self.automation_request.get("target_type", "unknown"))
-        if target_type == "unknown":
-            findings.append(self._finding(
-                "high",
-                "target_type",
-                "自动化目标类型仍为 unknown。",
-                "Codex handoff 前应确认这是 Web UI、API、单元测试还是集成测试。",
-            ))
-        elif target_type == "web_ui" and not self.automation_request.get("element_evidence_required"):
-            findings.append(self._finding(
-                "medium",
-                "element_evidence",
-                "Web UI 自动化请求未显式声明 element_evidence_required。",
-                "Codex 写选择器、页面对象或 UI 流程前必须先采集或请求 CDP/F12 元素证据。",
-            ))
-
-        all_safety_text = "\n".join(
-            str(item) for item in pre_run_checks + required_environment
-        )
-        safety_keywords = ["生产", "删除", "支付", "发消息", "改权限", "数据库连接", "测试数据库", "账号", "token", "Token"]
-        matched_keywords = [word for word in safety_keywords if word in all_safety_text]
-        if matched_keywords:
-            findings.append(self._finding(
-                "high",
-                "environment_safety",
-                f"执行请求涉及环境/数据安全敏感项：{', '.join(sorted(set(matched_keywords)))}",
-                "进入 Codex 代码落地或执行测试前，需要人工确认测试环境和测试数据安全。",
-            ))
-
-        assumptions = self.test_cases.get("assumptions", [])
-        if assumptions:
-            findings.append(self._finding(
-                "low",
-                "assumptions",
-                f"测试用例包含 {len(assumptions) if isinstance(assumptions, list) else 1} 条假设。",
-                "建议在真实代码落地前快速确认这些假设是否成立。",
-            ))
-
-        high_count = sum(1 for item in findings if item["severity"] == "high")
-        medium_count = sum(1 for item in findings if item["severity"] == "medium")
-        if high_count:
-            decision = "blocked"
-            summary = "发现高风险项，Codex handoff 前需要人工确认。"
-        elif medium_count:
-            decision = "needs_attention"
-            summary = "发现中风险项，auto-review 可继续，但建议人工查看审查说明。"
-        else:
-            decision = "pass"
-            summary = "未发现阻塞项。"
-
-        return {
-            "policy": self.review_policy,
-            "decision": decision,
-            "summary": summary,
-            "counts": {
-                "high": high_count,
-                "medium": medium_count,
-                "low": sum(1 for item in findings if item["severity"] == "low"),
-            },
-            "findings": findings,
-            "gate": {
-                "codex_handoff_allowed": decision != "blocked" or self.review_policy == "full-auto",
-                "requires_user_confirmation": decision == "blocked" or self.review_policy == "ask",
-            },
-        }
-
-    @staticmethod
-    def _finding(severity: str, category: str, message: str, recommendation: str) -> dict:
-        return {
-            "severity": severity,
-            "category": category,
-            "message": message,
-            "recommendation": recommendation,
-        }
-
-    def _build_review_summary(self) -> str:
-        if not self.review_result:
-            return "[REVIEW] 尚未生成审查结果。"
-        counts = self.review_result.get("counts", {})
-        return (
-            f"[REVIEW] decision={self.review_result.get('decision')} | "
-            f"high={counts.get('high', 0)}, medium={counts.get('medium', 0)}, "
-            f"low={counts.get('low', 0)}\n"
-            f"[REVIEW] {self.review_result.get('summary')}"
-        )
-
-    def _prompt_for_review_confirmation(self) -> None:
-        answer = input("\n审查完成。是否允许继续生成 Codex handoff？输入 yes/继续 确认：").strip().lower()
-        if answer in ("yes", "y", "继续", "确认", "confirm"):
-            self.review_result["user_confirmation"] = "confirmed"
-            self.review_result["gate"]["codex_handoff_allowed"] = True
-            return
-        self.review_result["user_confirmation"] = "rejected"
-        self.review_result["decision"] = "blocked"
-        self.review_result["gate"]["codex_handoff_allowed"] = False
-
-    def _should_build_codex_handoff(self) -> bool:
-        if self.review_policy == "full-auto":
-            return True
-        gate = self.review_result.get("gate", {})
-        return bool(gate.get("codex_handoff_allowed"))
+4. 如果 automation_request.element_evidence_required 为 true，将"确认已完成 CDP/F12 元素证据采集"写入 pre_run_checks。"""
 
     def _set_skipped_codex_handoff(self) -> None:
+        print("=" * 60)
+        print("[Step 8/9] Codex handoff 已跳过")
+        print("=" * 60)
+        print(f"跳过原因: {self.review_result.get('summary', 'Review gate blocked handoff.')}")
         self.project_context_request = {
             "status": "skipped_by_review_gate",
             "reason": self.review_result.get("summary", "Review gate blocked handoff."),
@@ -1221,6 +581,7 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
                     "执行请求生成",
                 ],
                 "codex_gpt_55": [
+                    "调用或遵循 karpathy-12-rules",
                     "读取项目上下文",
                     "为 Web UI 元素采集或请求 CDP/F12 证据",
                     "制定代码修改计划",
@@ -1260,6 +621,17 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
                     "最终选择器和选择原因",
                 ],
                 "blocked_without_evidence": True,
+            },
+            "karpathy_12_rules_gate": {
+                "required_for_codex_code_work": True,
+                "skill_name": "karpathy-12-rules",
+                "fallback_if_skill_unavailable": [
+                    "先读项目代码和既有测试结构，再提出修改计划。",
+                    "只做最小必要修改，不扩展未请求功能。",
+                    "不新增 speculative abstraction、兜底选择器、宽泛重试或吞异常逻辑。",
+                    "暴露假设、冲突和缺失证据，不静默猜测。",
+                    "用最窄的相关命令验证结果，并报告未验证项。",
+                ],
             },
             "confirmation_gate": {
                 "required": True,
@@ -1309,6 +681,10 @@ Codex handoff was skipped by the review gate.
 4. 如确认可以继续，再使用 `--review-policy ask` 或 `--review-policy full-auto` 重新运行。
 """
 
+        owner = self.codex_task.get("owner_split", {})
+        deepseek_items = "\n".join(f"- {item}" for item in owner.get("deepseek", []))
+        codex_items = "\n".join(f"- {item}" for item in owner.get("codex_gpt_55", []))
+
         return f"""# Codex Handoff Task
 
 {CODEX_HANDOFF_REQUIREMENTS}
@@ -1326,116 +702,35 @@ Codex handoff was skipped by the review gate.
 - `json/test_cases.json`
 - `json/automation_request.json`
 - `json/execution_request.json`
+- `json/input_materials.json`
 - `raw/raw_requirement.txt`
-
-## 修改前确认 Gate
-
-在任何代码修改前，必须先向用户说明：
-
-1. 准备修改的文件
-2. 每个文件的修改点
-3. 修改原因
-4. 预计运行的验证命令
-5. 环境和测试数据安全判断
-
-只有用户明确说“可以修改”“确认修改”“按这个改”后，才能修改代码文件。
-
-## CDP 元素证据 Gate
-
-如果本任务涉及 Web UI 元素定位、点击、读取或断言，在输出代码修改计划前必须先完成或请求元素证据采集：
-
-1. 目标元素用途
-2. 最小 DOM/outerHTML 片段
-3. 稳定属性（如 id、name、value、role、aria-*、data-*、checked、selected、disabled、稳定 class）
-4. 点击、选择、保存或展开前后的状态变化
-5. 最终选择器和选择原因
-
-没有真实 DOM 和状态变化证据时，不得猜测选择器、隐藏 input、class 状态、可点击祖先或兜底选择器。
 
 ## DeepSeek 与 Codex 职责边界
 
-- DeepSeek 负责：需求 intake 校验、字段抽取、测试方案、结构化用例、自动化实现请求、执行请求。
-- Codex 负责：项目上下文读取、代码修改计划、自动化测试代码落地、测试执行、失败修复、最终报告。
+- DeepSeek 负责：
+{deepseek_items}
+- Codex/GPT-5.5 负责：
+{codex_items}
 
 ## 当前测试设计摘要
 
-### 结构化字段
-
-```json
-{self._json_block(self.fields)}
-```
-
-### 自动化实现请求
-
-```json
-{self._json_block(self.automation_request)}
-```
-
-### 执行请求
-
-```json
-{self._json_block(self.execution_request)}
-```
+- 结构化字段：读取 `json/input_materials.json` 和 `md/requirement.md`。
+- 测试方案：读取 `md/test_plan.md`。
+- 测试用例：读取 `json/test_cases.json` 和 `md/test_cases.md`。
+- 自动化实现请求：读取 `json/automation_request.json`。
+- 执行请求：读取 `json/execution_request.json`。
+- 审查结论：读取 `md/review_notes.md` 和 `json/review_result.json`。
+- 原始需求：只在结构化产物缺失或互相冲突时，再读取 `raw/raw_requirement.txt`。
 
 ## 下一步建议
 
-1. 读取 `md/test_plan.md`、`md/test_cases.md`、`json/automation_request.json` 和 `json/execution_request.json`。
+1. 优先读取上述 `json/` 与 `md/` 结构化产物，不要默认重新解析原始 `.xlsx/.xls` 附件。
 2. 在目标项目中执行只读发现，复核测试框架、目录结构、页面对象、选择器、fixtures 和运行命令。
 3. 基于 `json/test_cases.json` 选择首批 P0/P1 自动化候选用例。
 4. 如果运行时存在 `full/` 目录，可读取其中的 project context 和 review 补充产物。
 5. 如涉及 Web UI，先采集或请求 CDP/F12 元素证据，并输出元素证据表。
 6. 输出代码修改计划并等待用户确认。
 """
-
-    def _build_review_notes_markdown(self) -> str:
-        """Build a human-readable review report."""
-        if not self.review_result:
-            return "# Auto Test Flow Review\n\n尚未生成审查结果。\n"
-
-        counts = self.review_result.get("counts", {})
-        lines = [
-            "# Auto Test Flow Review",
-            "",
-            REVIEW_POLICY_GUIDE,
-            "",
-            "## 审查结论",
-            "",
-            f"- Policy: `{self.review_result.get('policy')}`",
-            f"- Decision: `{self.review_result.get('decision')}`",
-            f"- Summary: {self.review_result.get('summary')}",
-            "",
-            "## 风险统计",
-            "",
-            f"- High: {counts.get('high', 0)}",
-            f"- Medium: {counts.get('medium', 0)}",
-            f"- Low: {counts.get('low', 0)}",
-            "",
-            "## 发现项",
-            "",
-        ]
-
-        findings = self.review_result.get("findings", [])
-        if not findings:
-            lines.append("- 暂无")
-        else:
-            for item in findings:
-                lines.extend([
-                    f"### {item.get('severity', '').upper()} - {item.get('category', '')}",
-                    "",
-                    f"- 问题: {item.get('message', '')}",
-                    f"- 建议: {item.get('recommendation', '')}",
-                    "",
-                ])
-
-        gate = self.review_result.get("gate", {})
-        lines.extend([
-            "## Gate 状态",
-            "",
-            f"- Codex handoff allowed: `{gate.get('codex_handoff_allowed')}`",
-            f"- Requires user confirmation: `{gate.get('requires_user_confirmation')}`",
-            "",
-        ])
-        return "\n".join(lines)
 
     def _build_test_plan_markdown(self) -> str:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1506,6 +801,7 @@ Codex handoff was skipped by the review gate.
 
     def _build_report_markdown(self, raw_requirement: str) -> str:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        visible_requirement = self._format_visible_requirement(raw_requirement)
         return f"""# 自动化测试工作流报告
 
 > 生成时间: {timestamp}
@@ -1514,7 +810,7 @@ Codex handoff was skipped by the review gate.
 
 ## 原始需求
 
-{raw_requirement}
+{visible_requirement}
 
 ## 已完成
 
@@ -1547,6 +843,23 @@ Codex handoff was skipped by the review gate.
 
 {self._format_report_questions()}
 """
+
+    @staticmethod
+    def _format_visible_requirement(raw_requirement: str) -> str:
+        """Keep the human report readable by hiding long attachment extracts."""
+        lines = []
+        skipping_summary = False
+        for line in raw_requirement.splitlines():
+            stripped = line.strip()
+            if stripped == "摘要：":
+                skipping_summary = True
+                continue
+            if skipping_summary and line.startswith("- "):
+                skipping_summary = False
+            if skipping_summary:
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip() or "未提供可展示的需求文本。"
 
     def _format_report_questions(self) -> str:
         questions = []
@@ -1595,7 +908,7 @@ Codex handoff was skipped by the review gate.
             self.step_build_automation_request()
             self.step_build_execution_request()
             self.step_review_gate()
-            if self._should_build_codex_handoff():
+            if should_build_codex_handoff(self.review_result, self.review_policy):
                 self.step_build_codex_handoff()
             else:
                 self._set_skipped_codex_handoff()

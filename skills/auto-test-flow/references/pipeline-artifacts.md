@@ -15,6 +15,7 @@ output/
     md/
       input_materials.md    # created by workbench runs with uploaded materials
       requirement.md
+      review_notes.md
       test_plan.md
       test_cases.md
       codex_task.md
@@ -37,7 +38,7 @@ output/
 
 This keeps human-readable artifacts under `md/`, user-friendly exports under `exports/`, machine-readable artifacts under `json/`, and raw input under `raw/`.
 `attachments/`, `md/input_materials.md`, `json/input_materials.json`, and `logs/` are optional and appear only when the interactive workbench receives uploads or executes commands.
-The local viewer should show only `md/report.md`, `md/requirement.md`, `md/test_plan.md`, `md/test_cases.md`, and the `exports/` files. `json/` and `md/codex_task.md` are background machine handoff artifacts, not routine manual-review files.
+The local viewer should show `md/report.md`, `md/review_notes.md`, `md/requirement.md`, `md/test_plan.md`, `md/test_cases.md`, and the `exports/` files. `md/review_notes.md` is the manual review entrypoint before Codex handoff. `json/` and `md/codex_task.md` are background machine handoff artifacts, not routine manual-review files.
 
 ## Full Artifacts
 

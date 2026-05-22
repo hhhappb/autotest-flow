@@ -31,7 +31,8 @@ Use this template when refining a rough Chinese testing request into a structure
 请重点考虑输入错误、权限不足、重复操作、网络异常、数据为空等情况：
 
 【测试重点】
-请重点覆盖：
+如果附件或输入已经列出明确测试点/测试用例，先按已有条目结构化输出，不主动新增未给出的场景。
+只有没有明确测试点/测试用例时，才重点覆盖：
 - 正常流程
 - 异常流程
 - 边界值

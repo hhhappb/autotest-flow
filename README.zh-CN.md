@@ -10,12 +10,12 @@
 
 - Inline 模式用于在对话中快速产出需求分析、测试设计和实现计划草稿。
 - Pipeline 模式用于把同一套流程落盘成更清晰的可审计产物。
-- Workbench 模式提供本地浏览器控制台，用于输入需求、上传附件、查看报告，并可选择交给 Codex。
+- Workbench 模式提供本地浏览器控制台，用于输入需求、上传附件、查看报告、执行 Codex、运行测试并预览 Allure 报告。
 - DeepSeek v4-pro 负责需求分析和结构化测试产物。
 - pipeline 在生成后续 prompt 前会先发现本地项目已有结构。
 - Web UI 自动化在修改 selector、page object、点击、读取或断言逻辑前，必须先有 CDP/F12 元素证据。
 - 每次运行会生成 `index.html`、Markdown 报告、Excel/XMind 导出、JSON 交接文件，以及可选的 full 审计产物。
-- Codex 接收专门的 handoff 任务包，负责项目发现、代码修改计划、测试实现、执行与修复。
+- Codex 接收精简后的 handoff 任务包，优先读取已生成的 `json/` 和 `md/` 产物，不再默认反复解析原始表格。
 - pipeline 本身不会修改项目代码，也不会真实执行测试。
 
 ## 能力概览
@@ -29,8 +29,9 @@
 - 导出 `.xlsx` 和 `.xmind` 测试用例文件。
 - 生成自动化实现请求和执行请求。
 - 通过 `auto-review`、`ask`、`full-auto` 三种策略审查产物。
-- 生成 Codex handoff 产物，用于后续测试代码落地。
+- 生成精简后的 Codex handoff 产物，用于后续测试代码落地。
 - 在 `127.0.0.1` 启动本地工作台。
+- 提供执行工作台，用于 Codex 执行、测试文件选择、环境选择、实时日志和嵌入式 Allure 报告预览。
 - 保留明确的用户确认 gate 和 UI 元素证据 gate，避免未经确认或缺少真实 DOM 证据就修改项目代码。
 
 ## Inline、Pipeline 与 Workbench
@@ -108,6 +109,8 @@ skills/
       element_evidence.py
       exporters.py
       orchestrator.py
+      project_discovery.py
+      review.py
       viewer.py
       workbench.py
       templates/
@@ -126,7 +129,7 @@ python "$env:USERPROFILE\.codex\skills\.system\skill-installer\scripts\install-s
 
 ## API 配置
 
-pipeline 使用 Anthropic-compatible API。默认配置面向 DeepSeek。
+pipeline 使用 Anthropic-compatible API。默认配置面向 DeepSeek V4 Flash，用于更快地完成需求整理、测试方案和测试用例生成。只有遇到特别复杂或歧义很强的测试任务时，才建议临时切到 V4 Pro。
 
 如果本地还没有 Python client，请先安装：
 
@@ -137,6 +140,12 @@ python -m pip install anthropic
 ```powershell
 $env:ANTHROPIC_AUTH_TOKEN="你的 API Key"
 $env:ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
+$env:ANTHROPIC_MODEL="deepseek-v4-flash"
+```
+
+复杂任务可以临时切换到更强模型：
+
+```powershell
 $env:ANTHROPIC_MODEL="deepseek-v4-pro"
 ```
 
@@ -174,8 +183,10 @@ http://127.0.0.1:8765/
 - 上传图片、`.xlsx`、`.csv`、`.txt`、`.md` 等本地材料。
 - 运行 `orchestrator.py`。
 - 预览生成的运行目录。
-- 将 `md/codex_task.md` 交给 Codex，以只读提案模式或确认后的执行模式继续。
-- 执行命令时把日志保存在运行目录下。
+- 在执行工作台选择生成产物、批准 Codex 执行，并保持一次运行闭环，不再拆成只读预审和二次落地。
+- 通过 `runner.py` 运行生成或选中的 pytest 文件，支持 `test`、`prod`、`all` 环境选择。
+- 将 Codex 和测试日志实时显示在页面中，同时保留运行目录下的原始日志。
+- 在同一个结果区域预览 Codex 摘要、执行日志和 Allure 报告。
 
 ## Pipeline 用法
 
@@ -226,7 +237,7 @@ python orchestrator.py "测试登录页面" --full-artifacts
 | `ask` | 在 Codex handoff 前始终通过命令行询问确认。适合真实项目即将落代码的场景。 |
 | `full-auto` | 写入审查结果但不阻塞流程。仅适合快速草稿或低风险探索。 |
 
-审查 gate 会检查测试用例范围过大、自动化候选用例过多、目标类型未知、框架选择未确认、环境或数据安全风险等信号。
+审查 gate 会检查测试用例范围过大、自动化候选用例过多、目标类型未知、框架选择未确认、环境或数据安全风险等信号。前台会把它显示成 `交接审查`，内容来自 `md/review_notes.md`。
 
 ## 输出产物
 
@@ -240,6 +251,7 @@ output/
       raw_requirement.txt
     md/
       requirement.md
+      review_notes.md
       test_plan.md
       test_cases.md
       report.md
@@ -257,7 +269,7 @@ output/
     full/                   # 仅使用 --full-artifacts 时出现
 ```
 
-可以在浏览器中打开 `index.html`，查看面向人工阅读的 Markdown 和导出文件。JSON 和 Codex handoff 文件仍保留在磁盘上，供自动化和排查使用，但不再作为主要人工审查入口。
+可以在浏览器中打开 `index.html`，查看面向人工阅读的 Markdown、交接审查结果和导出文件。JSON 和 Codex handoff 文件仍保留在磁盘上，供自动化和排查使用，但不再作为主要人工审查入口。
 
 `md/codex_task.md` 和 `json/codex_task.json` 是交给 Codex 的任务包。Codex 应先读取项目，必要时采集 UI 元素证据，提出代码修改计划，等待用户确认，然后才能修改测试代码。
 
@@ -299,12 +311,16 @@ Web UI 自动化不要猜选择器。新增或修改 selector、page object 操�
 
 本版本重点：
 
-- 新增本地浏览器工作台，用于输入需求、上传本地材料、查看生成结果，并可选择交给 Codex。
+- 新增本地浏览器工作台，用于输入需求、上传本地材料、查看生成结果、执行 Codex、运行测试并预览 Allure 报告。
 - 增加打开 `http://127.0.0.1:8765/` 的工作台启动说明。
+- 重设计执行工作台，支持可收起产物队列、Codex 状态、测试运行面板、结果 tabs 和嵌入式 Allure iframe。
+- Codex 执行改为一次 workspace-write 运行，由审批策略和项目指令兜底，避免旧的 read-only 二次重跑流程。
+- Codex prompt 交接进一步瘦身：通过路径引用生成的 `json/` 和 `md/` 产物，删除大段内嵌 JSON 和重复 Gate。
 - 默认产物结构改为更清晰的 `md/`、`json/`、`exports/`、`raw/`。
 - 新增 Excel 和 XMind 测试用例导出。
 - 支持 `--serve --port` 本地查看服务。
 - 支持 `--full-artifacts` 保留完整审计产物。
 - 增加 CDP/F12 元素证据 gate，约束 Web UI 自动化不要猜 selector。
 - 增强测试范围控制，避免用户只指定一个测试点时扩展同一材料里的无关功能。
+- 已有测试点/测试用例会被视为唯一事实来源，除非用户要求，不再自动补异常、边界、权限等额外用例。
 - 在自动化规划前继续优先检查已有项目约定。

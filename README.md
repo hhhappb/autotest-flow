@@ -10,12 +10,12 @@ The current release focuses on a local workbench and safer UI automation handoff
 
 - Inline mode provides a lightweight conversational draft of requirement analysis, test design, and implementation planning.
 - Pipeline mode persists the same workflow into auditable artifacts with a cleaner human-facing layout.
-- Workbench mode starts a local browser control panel for requirements, attachments, generated reports, and optional Codex handoff.
+- Workbench mode starts a local browser control panel for requirements, attachments, generated reports, Codex execution, test runs, and Allure report preview.
 - DeepSeek v4-pro handles requirement analysis and structured testing artifacts.
 - The pipeline discovers the existing local project structure before generating downstream prompts.
 - CDP/F12 element evidence is required before Web UI selector, page-object, click, read, or assertion changes.
 - Each run writes `index.html`, Markdown reports, Excel and XMind exports, JSON handoff files, and optional full audit artifacts.
-- Codex receives a dedicated handoff package for project discovery, code-change planning, test implementation, execution, and repair.
+- Codex receives a compact handoff package that prioritizes generated `json/` and `md/` artifacts instead of reparsing raw spreadsheets.
 - The pipeline itself does not modify project code or run tests.
 
 ## What It Does
@@ -29,8 +29,9 @@ The current release focuses on a local workbench and safer UI automation handoff
 - Exports test cases as `.xlsx` and `.xmind`.
 - Produces automation implementation and execution requests.
 - Reviews generated artifacts with `auto-review`, `ask`, or `full-auto` policies.
-- Generates Codex handoff artifacts for later code implementation.
+- Generates compact Codex handoff artifacts for later code implementation.
 - Serves a local workbench at `127.0.0.1` for browser-based operation.
+- Provides an execution workbench for Codex execution, test-file selection, environment selection, real-time logs, and embedded Allure reports.
 - Keeps project code changes behind explicit user confirmation and UI element evidence gates.
 
 ## Inline, Pipeline, And Workbench
@@ -108,6 +109,8 @@ skills/
       element_evidence.py
       exporters.py
       orchestrator.py
+      project_discovery.py
+      review.py
       viewer.py
       workbench.py
       templates/
@@ -126,7 +129,7 @@ Restart Codex or Claude Code after installing or updating the skill so the new i
 
 ## API Configuration
 
-The pipeline uses an Anthropic-compatible API. By default, it is configured for DeepSeek.
+The pipeline uses an Anthropic-compatible API. By default, it is configured for DeepSeek V4 Flash for faster requirement, plan, and test-case generation. Use V4 Pro only when you need higher-quality reasoning for unusually complex or ambiguous testing work.
 
 Install the Python client if it is not already available:
 
@@ -137,6 +140,12 @@ python -m pip install anthropic
 ```powershell
 $env:ANTHROPIC_AUTH_TOKEN="your-api-key"
 $env:ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
+$env:ANTHROPIC_MODEL="deepseek-v4-flash"
+```
+
+Optionally switch to the stronger model for complex runs:
+
+```powershell
 $env:ANTHROPIC_MODEL="deepseek-v4-pro"
 ```
 
@@ -174,8 +183,10 @@ The workbench can:
 - Attach local materials such as images, `.xlsx`, `.csv`, `.txt`, and `.md`.
 - Run `orchestrator.py`.
 - Preview generated run folders.
-- Hand `md/codex_task.md` to Codex in read-only proposal mode or confirmed execution mode.
-- Keep logs under the run folder when commands are executed.
+- Use the execution workbench to select a generated artifact, approve Codex execution, and keep Codex in one run instead of a separate read-only pass.
+- Run generated or selected pytest files through `runner.py` with `test`, `prod`, or `all` environment choices.
+- Stream Codex and test logs into the page while preserving raw logs under the run folder.
+- Preview Codex summaries, execution logs, and Allure reports in a single tabbed result area.
 
 ## Pipeline Usage
 
@@ -226,7 +237,7 @@ python orchestrator.py "Test the login page" --full-artifacts
 | `ask` | Always prompts in the command line before Codex handoff. Use this when a real project change is likely. |
 | `full-auto` | Writes review results but never blocks. Use only for quick drafts or low-risk exploration. |
 
-The review gate checks for signals such as excessive test case scope, too many automation candidates, unknown target type, unconfirmed framework choice, and environment or data safety risks.
+The review gate checks for signals such as excessive test case scope, too many automation candidates, unknown target type, unconfirmed framework choice, and environment or data safety risks. The visible viewer exposes this as the `Handoff Review` / `交接审查` section backed by `md/review_notes.md`.
 
 ## Output Artifacts
 
@@ -240,6 +251,7 @@ output/
       raw_requirement.txt
     md/
       requirement.md
+      review_notes.md
       test_plan.md
       test_cases.md
       report.md
@@ -257,7 +269,7 @@ output/
     full/                   # only when --full-artifacts is used
 ```
 
-Open `index.html` in a browser to review the human-readable Markdown and export files. JSON and Codex handoff files remain available on disk for automation and debugging, but they are no longer the primary manual-review surface.
+Open `index.html` in a browser to review the human-readable Markdown, the handoff review result, and export files. JSON and Codex handoff files remain available on disk for automation and debugging, but they are no longer the primary manual-review surface.
 
 `md/codex_task.md` and `json/codex_task.json` are the handoff artifacts for Codex. Codex should read the project, collect UI element evidence when needed, propose a code-change plan, wait for user confirmation, and only then modify test code.
 
@@ -299,12 +311,16 @@ Current version: `v0.5`
 
 Release focus:
 
-- Local browser workbench for requirement input, local materials, generated runs, and optional Codex handoff.
+- Local browser workbench for requirement input, local materials, generated runs, Codex execution, test runs, and Allure report preview.
 - Workbench startup instructions for opening `http://127.0.0.1:8765/`.
+- Redesigned execution workbench with a collapsible artifact queue, Codex status, test-run panel, result tabs, and embedded Allure iframe.
+- Codex execution now uses a single workspace-write run guarded by approval policy and project instructions, avoiding the old read-only rerun loop.
+- Codex prompt handoff is slimmer: generated `json/` and `md/` artifacts are referenced by path, while large embedded JSON and repeated gates are removed.
 - Slimmer default artifact layout with `md/`, `json/`, `exports/`, and `raw/`.
 - Excel and XMind test case exports.
 - `--serve --port` local viewer support.
 - `--full-artifacts` for audit-heavy runs.
 - CDP/F12 element evidence gate for Web UI automation.
 - Scope control for user-specified test points so the pipeline does not expand unrelated functions from the same material set.
+- Existing test points/cases are treated as the source of truth; the pipeline does not add exception, boundary, or permission cases unless requested.
 - Existing-project convention checks before automation planning.

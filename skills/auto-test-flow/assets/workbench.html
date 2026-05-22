@@ -12,18 +12,20 @@
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark">AT</div>
-        <div>
+        <div class="brand-text">
           <strong>testhub</strong>
           <span>自动化测试平台</span>
         </div>
+        <button id="sidebarToggleBtn" class="sidebar-toggle" type="button" title="收起侧边栏">收起</button>
       </div>
 
       <nav class="nav">
-        <button class="nav-item active" data-view="dashboard" type="button">Dashboard</button>
-        <button class="nav-item" data-view="generate" type="button">AI 用例生成</button>
-        <button class="nav-item" data-view="runs" type="button">执行记录</button>
-        <button class="nav-item" data-view="reports" type="button">测试报告</button>
-        <button class="nav-item" data-view="settings" type="button">设置</button>
+        <button class="nav-item active" data-view="dashboard" data-short="D" type="button"><span>Dashboard</span></button>
+        <button class="nav-item" data-view="generate" data-short="AI" type="button"><span>AI 用例生成</span></button>
+        <button class="nav-item" data-view="execute" data-short="EX" type="button"><span>执行工作台</span></button>
+        <button class="nav-item" data-view="runs" data-short="R" type="button"><span>执行记录</span></button>
+        <button class="nav-item" data-view="reports" data-short="AR" type="button"><span>测试报告</span></button>
+        <button class="nav-item" data-view="settings" data-short="S" type="button"><span>设置</span></button>
       </nav>
     </aside>
 
@@ -88,6 +90,7 @@
             </div>
             <div class="quick-grid">
               <button class="quick-card" data-view-target="generate" type="button"><span class="quick-icon blue"></span>AI 用例生成</button>
+              <button class="quick-card" data-view-target="execute" type="button"><span class="quick-icon violet"></span>执行工作台</button>
               <button class="quick-card" data-view-target="runs" type="button"><span class="quick-icon cyan"></span>执行记录</button>
               <button class="quick-card" data-view-target="reports" type="button"><span class="quick-icon pink"></span>测试报告</button>
               <button class="quick-card" data-view-target="settings" type="button"><span class="quick-icon orange"></span>设置</button>
@@ -107,11 +110,7 @@
                 <div class="sidebar-summary">
                   <button class="summary-card" type="button" data-sidebar-focus="requirement">
                     <strong>测试任务输入</strong>
-                    <span>需求、材料、审查策略</span>
-                  </button>
-                  <button class="summary-card" type="button" data-sidebar-focus="codex">
-                    <strong>Codex 执行</strong>
-                    <span>代码落地、补充指令</span>
+                    <span>需求、材料、交接门禁</span>
                   </button>
                 </div>
 
@@ -129,31 +128,26 @@
 
                     <div class="row">
                       <div>
-                        <label for="reviewPolicy">审查策略</label>
-                        <select id="reviewPolicy">
-                          <option value="auto-review">自动审查，发现高风险时暂停</option>
-                          <option value="full-auto">全自动，不因审查结果暂停</option>
+                        <label for="deepseekModel">DeepSeek 模型</label>
+                        <select id="deepseekModel">
+                          <option value="deepseek-v4-flash">deepseek-v4-flash - 快速，推荐</option>
+                          <option value="deepseek-v4-pro">deepseek-v4-pro - 更强，较慢</option>
                         </select>
                       </div>
+                    </div>
+
+                    <div class="row">
                       <div>
-                        <label for="approvalPolicy">Codex 审批</label>
-                        <select id="approvalPolicy">
-                          <option value="on-request">需要时请求确认</option>
-                          <option value="never">不请求确认，直接按权限执行</option>
+                        <label for="reviewPolicy">Codex 交接门禁</label>
+                        <select id="reviewPolicy">
+                          <option value="auto-review">自动审查，高风险时阻止交接</option>
+                          <option value="full-auto">只生成审查结果，不阻止交接</option>
                         </select>
                       </div>
                     </div>
 
                     <label class="check"><input id="fullArtifacts" type="checkbox"> 生成 full/ 审计产物</label>
                     <button id="generateBtn" type="button">生成测试计划/交接产物</button>
-                  </div>
-
-                  <div id="codexBlock" class="side-block">
-                    <h3>Codex 执行</h3>
-                    <label class="check"><input id="allowEdits" type="checkbox"> 允许 Codex 在本任务范围内修改代码</label>
-                    <label for="extraInstruction">补充指令</label>
-                    <textarea id="extraInstruction" class="compact-textarea" placeholder="可选：例如只生成修改方案，不跑测试。"></textarea>
-                    <button id="codexBtn" class="danger" type="button">调用 Codex 执行</button>
                   </div>
                 </div>
               </section>
@@ -181,20 +175,155 @@
               <section class="panel preview-section">
                 <div class="panel-title">
                   <h2>产物预览</h2>
+                  <div class="title-actions preview-actions">
+                    <button id="openReviewBtn" class="secondary small" type="button">审查</button>
+                    <button id="openArtifactBtn" class="secondary small" type="button">产物</button>
+                    <button id="focusPreviewBtn" class="secondary small" type="button">放大预览</button>
+                  </div>
                 </div>
+                <button id="reviewStatus" class="review-status is-empty" type="button"></button>
                 <div id="previewEmpty" class="preview-empty">生成或选择产物后在这里预览</div>
                 <iframe id="preview" class="preview-frame" title="artifact preview"></iframe>
               </section>
 
               <section class="panel log-section">
                 <div class="panel-title">
-                  <h2>执行日志</h2>
+                  <h2>Codex 决策摘要</h2>
                   <div class="title-actions">
-                    <button id="toggleLogExpandBtn" class="secondary small" type="button">展开日志</button>
+                    <button id="toggleLogExpandBtn" class="secondary small" type="button">展开摘要</button>
                     <button id="scrollLogBottomBtn" class="secondary small" type="button">跳到底部</button>
                   </div>
                 </div>
                 <pre id="log" class="log-output"></pre>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section id="viewExecute" class="view">
+          <div class="execute-workbench">
+            <section class="panel execute-queue-panel">
+              <div class="panel-title">
+                <div>
+                  <h2>产物队列</h2>
+                  <p class="panel-subtitle">选择一个 AI 生成产物进入执行链路</p>
+                </div>
+                <button id="refreshExecuteRunsBtn" class="secondary small icon-button" type="button" title="刷新列表">刷新</button>
+              </div>
+              <div id="executeRuns" class="runs execute-runs-list"></div>
+            </section>
+
+            <div class="execute-main">
+              <section class="panel execute-current-panel">
+                <div class="panel-title">
+                  <div>
+                    <h2>当前产物</h2>
+                    <p class="panel-subtitle">审查状态、Codex 状态和最近执行结果</p>
+                  </div>
+                  <span id="executeRunName" class="panel-meta">未选择产物</span>
+                </div>
+                <div id="executeEmpty" class="empty-state compact-empty">选择左侧产物后，可以批准 Codex 接手代码落地、运行测试并查看报告。</div>
+                <div id="executeDetail" class="execute-detail">
+                  <div class="execute-status-grid">
+                    <div>
+                      <span>审查状态</span>
+                      <strong id="executeReviewStatusText">-</strong>
+                    </div>
+                    <div>
+                      <span>Codex 状态</span>
+                      <strong id="executeCodexStatusText">-</strong>
+                    </div>
+                    <div>
+                      <span>退出码</span>
+                      <strong id="executeExitCodeText">-</strong>
+                    </div>
+                  </div>
+
+                  <div class="status execute-job-status">
+                    <span id="executeStatusDot" class="dot"></span>
+                    <span id="executeStatusText">等待执行</span>
+                  </div>
+                </div>
+              </section>
+
+              <div class="execute-actions-grid">
+                <section class="panel execute-control-panel">
+                  <div class="panel-title">
+                    <div>
+                      <h2>Codex 执行</h2>
+                      <p class="panel-subtitle">交给 Codex 接管代码落地与验证</p>
+                    </div>
+                  </div>
+                  <div class="execute-options">
+                    <label for="executeApprovalPolicy">Codex 审批</label>
+                    <select id="executeApprovalPolicy">
+                      <option value="on-request">需要时请求确认</option>
+                      <option value="never">不请求确认，直接按权限执行</option>
+                    </select>
+                    <label for="executeExtraInstruction">启动前补充指令（非聊天）</label>
+                    <textarea id="executeExtraInstruction" class="compact-textarea" placeholder="这是一段随本次 Codex 执行一起发送的一次性要求，例如先输出修改计划、确认后再落地。"></textarea>
+                    <div class="execute-action-row">
+                      <button id="executeCodexBtn" type="button">批准 Codex 执行</button>
+                      <button id="executeOpenReviewBtn" class="secondary small" type="button">查看审查</button>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="panel execute-test-panel">
+                  <div class="panel-title">
+                    <div>
+                      <h2>测试运行</h2>
+                      <p class="panel-subtitle">选择测试文件、环境并查看 Allure 报告</p>
+                    </div>
+                  </div>
+                  <div class="execute-options">
+                    <label for="testPath">测试文件</label>
+                    <div class="path-row">
+                      <input id="testPath" type="text" placeholder="例如 project/feikua/testcases/blackWhiteList/test_black_intercept.py">
+                      <button id="browseTestFileBtn" class="secondary small" type="button">浏览</button>
+                    </div>
+                    <label for="testEnv">环境</label>
+                    <select id="testEnv">
+                      <option value="test">测试站</option>
+                      <option value="production">正式站</option>
+                      <option value="all">ALL（全跑）</option>
+                    </select>
+                    <div class="status test-job-status">
+                      <span id="testStatusDot" class="dot"></span>
+                      <span id="testStatusText">等待执行</span>
+                    </div>
+                    <div class="execute-action-row">
+                      <button id="runTestBtn" type="button">运行测试</button>
+                      <button id="openAllureBtn" class="secondary small" type="button">打开 Allure 报告</button>
+                    </div>
+                  </div>
+                </section>
+              </div>
+
+              <section class="panel execute-result-panel">
+                <div class="panel-title">
+                  <div>
+                    <h2>执行结果</h2>
+                    <p class="panel-subtitle">统一查看 Codex 摘要、实时日志与测试报告</p>
+                  </div>
+                  <div class="execute-tabs" role="tablist" aria-label="执行结果">
+                    <button class="result-tab active" data-execute-tab="summary" type="button">Codex 摘要</button>
+                    <button class="result-tab" data-execute-tab="log" type="button">执行日志</button>
+                    <button class="result-tab" data-execute-tab="allure" type="button">Allure 报告</button>
+                  </div>
+                </div>
+                <div class="execute-tab-body">
+                  <div id="executeSummaryPanel" class="execute-tab-panel active">
+                    <div id="executePreviewEmpty" class="preview-empty">选择产物或执行 Codex 后在这里预览摘要</div>
+                    <iframe id="executePreview" class="preview-frame" title="codex execution preview"></iframe>
+                  </div>
+                  <div id="executeLogPanel" class="execute-tab-panel">
+                    <pre id="executeLog" class="log-output visible-log"></pre>
+                  </div>
+                  <div id="executeAllurePanel" class="execute-tab-panel">
+                    <iframe id="executeAllureFrame" class="preview-frame" title="Allure execution preview" src="/allure/allure_report/index.html"></iframe>
+                  </div>
+                </div>
               </section>
             </div>
           </div>
@@ -213,6 +342,7 @@
               <div class="panel-title">
                 <h2>记录预览</h2>
               </div>
+              <button id="runReviewStatus" class="review-status is-empty" type="button"></button>
               <div id="runPreviewEmpty" class="preview-empty">点击左侧记录后在这里打开</div>
               <iframe id="runPreview" class="preview-frame" title="run artifact preview"></iframe>
             </section>
@@ -220,9 +350,12 @@
         </section>
 
         <section id="viewReports" class="view">
-          <section class="panel placeholder-panel">
-            <h2>测试报告</h2>
-            <p>选择执行记录后，可在执行记录页右侧预览报告和产物。</p>
+          <section class="panel" style="flex:1; display:flex; flex-direction:column;">
+            <div class="panel-title">
+              <h2>测试报告</h2>
+              <button id="refreshReportBtn" class="secondary small" type="button">刷新报告</button>
+            </div>
+            <iframe id="allureReportFrame" class="preview-frame" title="Allure 测试报告" src="/allure/allure_report/index.html"></iframe>
           </section>
         </section>
 

@@ -14,6 +14,7 @@ Use this skill as the coordinator for QA automation work. Keep the main flow sho
 - Keep implementation small: first automate the highest-value P0/P1 path, then expand only when requested or justified by risk.
 - For UI automation, do not guess selectors. Element evidence from CDP, DevTools/F12, or an equivalent live DOM inspection is a gate before selector, page-object, or test-flow changes.
 - Before modifying code, selectors, page objects, test data, or test flow, list target files, intended changes, reasons, data/environment impact, and validation commands, then wait for explicit user confirmation.
+- During Codex code implementation, repair, review, or execution handoff, invoke or follow `karpathy-12-rules` first. If that skill is unavailable, apply its core discipline directly: read before writing, keep changes surgical, avoid speculative abstractions and fallbacks, surface assumptions, and verify the narrowest meaningful result.
 
 ## Reference Map
 
@@ -75,7 +76,7 @@ json/test_cases.json
 json/execution_request.json
 ```
 
-The local viewer shows only the human-readable files and exports. JSON files and `md/codex_task.md` are kept as background machine handoff artifacts for Codex and are not meant for routine manual review. Use `--full-artifacts` for audit/detail files and `--serve --port 8765` for a local clickable viewer. See `references/local-viewer.md` and `references/pipeline-artifacts.md`.
+The local viewer shows the human-readable files, exports, and a visible `交接审查` section backed by `md/review_notes.md`. JSON files and `md/codex_task.md` are kept as background machine handoff artifacts for Codex and are not meant for routine manual review. Use `--full-artifacts` for audit/detail files and `--serve --port 8765` for a local clickable viewer. See `references/local-viewer.md` and `references/pipeline-artifacts.md`.
 
 ### Workbench Mode
 
@@ -123,7 +124,7 @@ Produce:
 - Need-confirmation questions.
 - Recommended first automation subset.
 
-Prefer a small P0/P1 set for the first implementation. Cover happy path, exception path, boundary values, permission control, data states, interface validation, security risks, and regression points when applicable.
+If the user input or attached material already contains explicit test points or test cases, treat those rows as the source of truth: structure only those items, do not add exception, boundary, permission, security, compatibility, or regression cases unless the user or material explicitly asks for them. If one row expresses one test point, generate one corresponding case by default. Only generate a small P0/P1 set yourself when no explicit test point or case exists. Put missing details in need-confirmation questions instead of inventing extra cases.
 
 ### 4. CDP Element Evidence Gate
 
@@ -146,6 +147,7 @@ Use `references/automation-code-rules.md` before editing code.
 
 Implementation rules:
 
+- Apply `karpathy-12-rules` before writing or changing code. Treat this as the coding discipline layer on top of the QA workflow.
 - Reuse existing page objects, selector classes, fixtures, base helpers, and runner patterns.
 - Keep test cases focused on flow and assertions; put reusable page details in page objects.
 - Add selectors to existing selector classes only when they are reusable; single-use selectors may stay in the test when the project allows it.

@@ -19,6 +19,7 @@ output/<feature>_<timestamp>/
     requirement.md
     test_plan.md
     test_cases.md
+    review_notes.md
     codex_task.md
     report.md
   exports/
@@ -46,7 +47,7 @@ full/
 ```
 
 Default runs should stay slim. Do not generate full artifacts unless the user asks for full audit output or a downstream machine process needs them.
-The visible viewer should stay human-focused: report, requirement context, test plan, test cases, Excel export, and XMind export. JSON and Codex handoff files should remain available on disk for background automation, but they should not be shown as primary viewer navigation.
+The visible viewer should stay human-focused: report, 交接审查, requirement context, test plan, test cases, Excel export, and XMind export. `md/review_notes.md` is the manual review entrypoint before Codex handoff. JSON and Codex handoff files should remain available on disk for background automation, but they should not be shown as primary viewer navigation.
 
 ## Static Local Server
 
