@@ -24,7 +24,10 @@ TEST_PLAN_SYSTEM_PROMPT = """你是一名资深测试工程师。请根据以下
 {exception_scenarios}
 
 【测试重点】
-请重点覆盖：
+如果用户输入或附件材料已经明确列出测试点/测试用例（例如“自动化功能点.xlsx”里指定了某个功能点），只围绕这些已明确的测试点输出，不额外扩展未指定模块、未指定功能点或无关场景。
+如果用户只指定其中一个功能点，只完成该功能点；不要把同一表格里的其他功能点一起展开。
+
+在不违反上述范围的前提下，请重点覆盖：
 - 正常流程
 - 异常流程
 - 边界值
@@ -67,6 +70,8 @@ TEST_CASES_JSON_SYSTEM_PROMPT = """你是一名资深测试用例设计专家。
 }
 
 要求：
+- 如果输入材料已经明确给出测试点或测试用例，必须优先复用这些测试点/用例，不要额外扩写测试范围。
+- 如果用户只指定材料中的某一个功能点，只生成该功能点相关用例，不要展开材料中的其他功能点。
 - 优先覆盖 1-2 个 P0 主流程，以及 2-4 个 P1 异常、边界或权限场景。
 - 不要编造具体接口地址、账号、密码或真实数据。
 - 如果信息缺失，用 assumptions 和 need_confirmation 表达，不要让用例失去可执行性。
@@ -83,6 +88,13 @@ AUTOMATION_REQUEST_JSON_SYSTEM_PROMPT = """你是一名自动化测试架构师�
   "target_type": "web_ui/api/unit/integration/unknown",
   "recommended_framework": "推荐框架或 existing_project_framework",
   "project_context_needed": ["需要读取或确认的项目上下文"],
+  "element_evidence_required": true,
+  "cdp_capture_targets": ["Web UI 自动化前需要用 CDP/F12 确认的元素、状态或 DOM 片段"],
+  "selector_change_gate": {
+    "required_before_code_change": true,
+    "evidence_needed": ["outerHTML 或最小 DOM 片段", "稳定属性", "点击/选择/保存前后的状态变化"],
+    "blocked_without_evidence": ["新增或修改 selector", "新增或修改 page object 操作", "新增或修改 UI 点击/读取/断言流程"]
+  },
   "selected_cases": ["建议首批自动化落地的用例编号"],
   "suggested_changes": {
     "page_objects": ["可能需要新增或补充的页面对象职责"],
@@ -98,6 +110,8 @@ AUTOMATION_REQUEST_JSON_SYSTEM_PROMPT = """你是一名自动化测试架构师�
 要求：
 - 遵循已有项目约定优先，不建议盲目引入新框架。
 - 对 Web UI 优先考虑 page object、selector、testcase 的分层。
+- 对 Web UI，如果需要新增或修改选择器、页面对象、点击、读取或断言逻辑，element_evidence_required 必须为 true，并列出 cdp_capture_targets。
+- 不要猜测 DOM、隐藏 input、class 状态或兜底选择器；证据不足时写入 need_confirmation。
 - 对 API 优先考虑 base URL、认证、schema、幂等和清理策略。
 - 不输出代码。"""
 
@@ -129,6 +143,8 @@ CODEX_HANDOFF_REQUIREMENTS = """Codex handoff 阶段要求：
 - 不要重新设计测试方案，优先使用 pipeline 已生成的 test_cases.json、automation_request.json 和 execution_request.json。
 - 修改代码前必须先输出修改计划，列出准备修改的文件、每个文件的修改点、修改原因和预计验证命令。
 - 未经用户明确确认，不得修改测试代码、选择器、页面对象或测试流程。
+- 如果涉及 Web UI 元素定位、点击、读取或断言，修改计划前必须先通过 CDP、浏览器检查工具或用户提供的 F12 DOM 收集元素证据，并输出元素证据表。
+- 没有真实 DOM、稳定属性和必要状态变化证据时，不得猜 selector、不得添加兜底选择器、不得用 body 文本扫描绕过。
 - 代码落地时优先复用已有 page object、selector、fixture、runner 和项目命名规范。
 - 如果项目上下文不足，先读取 project_context_request.json 中列出的候选文件和目录，再决定修改方案。
 - 运行测试前必须确认环境安全，避免在生产环境执行会写入、删除、支付、发消息或改权限的流程。"""

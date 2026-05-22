@@ -3,7 +3,7 @@
 
 流程:
     粗略需求
-    → Boost 优化
+    → intake 校验
     → 结构化字段抽取
     → 测试方案生成
     → 测试用例结构化
@@ -17,27 +17,26 @@
     python orchestrator.py "对登录页面进行功能测试"
     python orchestrator.py --file requirements.txt
     python orchestrator.py "输入需求" --output-dir ./output
-    python orchestrator.py --file req.txt --skip-boost
 """
 
 import argparse
-import html
+import functools
+import http.server
 import json
 import os
 import re
+import socketserver
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from anthropic import Anthropic
+from exporters import write_test_cases_xlsx, write_test_cases_xmind
+from viewer import build_html_viewer
 
 from config import (
     ANTHROPIC_AUTH_TOKEN,
     ANTHROPIC_BASE_URL,
     MODEL,
-    SYSTEM_PROMPT_BOOST,
-    BOOST_TEMPERATURE,
-    BOOST_MAX_TOKENS,
     PLAN_TEMPERATURE,
     PLAN_MAX_TOKENS,
 )
@@ -54,7 +53,7 @@ from templates.test_plan_prompt import (
 REVIEW_POLICIES = ("ask", "auto-review", "full-auto")
 
 
-EXTRACT_FIELDS_SYSTEM_PROMPT = """你是一个需求分析师。请从以下优化后的测试需求描述中，提取出关键字段。
+EXTRACT_FIELDS_SYSTEM_PROMPT = """你是一个需求分析师。请从以下测试需求上下文中，提取出关键字段。
 返回纯JSON格式（不要带```json标记），包含以下字段：
 {
     "test_object": "测试对象说明",
@@ -67,15 +66,40 @@ EXTRACT_FIELDS_SYSTEM_PROMPT = """你是一个需求分析师。请从以下优�
 }"""
 
 
+INTAKE_VALIDATION_SYSTEM_PROMPT = """你是自动化测试需求 intake 审查员。你的任务不是扩写需求，而是判断用户输入和附件摘要中是否能识别出一个可用于生成测试计划/测试用例的测试点。
+
+请只返回纯 JSON，不要输出 markdown，不要输出 ```json。
+
+返回格式：
+{
+  "status": "ready 或 needs_clarification",
+  "normalized_requirement": "当 status=ready 时，基于用户输入和材料摘要整理出保守的需求上下文；不要编造页面、账号、步骤、预期",
+  "reason": "简短原因",
+  "questions": ["当 status=needs_clarification 时，列出需要用户补充的问题"]
+}
+
+判定规则：
+- 这是“生成测试计划/测试用例”的入口，不是“直接写自动化代码”的入口；不要用代码实现所需的严格程度来阻断用例生成。
+- 只要能从用户输入或附件摘要中识别出测试对象/系统/模块/功能点，并能找到相关测试说明、URL、规则、场景、状态、预期倾向或测试点描述，就返回 ready。
+- 如果用户说“根据文档/表格里的某功能点生成测试用例”，且附件摘要里存在对应功能点行或相关上下文，应返回 ready；缺少的细节放到后续 need_confirmation，不要在 intake 阶段阻断。
+- 如果只是数字、编号、单词、泛泛一句话、只有“测试一下”，且附件摘要也无法定位测试对象或测试点，则返回 needs_clarification。
+- 如果缺少关键信息但仍能生成测试用例草案，返回 ready，并把缺失信息写入 normalized_requirement 的“待确认”部分。
+- 不要为了继续流程而猜测业务背景、页面元素、选择器、账号、团队、环境、预期结果。
+"""
+
+
 class TestWorkflowOrchestrator:
     """Phase 2.6 orchestrator with review policy and Codex handoff."""
 
     def __init__(self):
+        from anthropic import Anthropic
+
         self.client = Anthropic(
             auth_token=ANTHROPIC_AUTH_TOKEN,
             base_url=ANTHROPIC_BASE_URL,
         )
-        self.boosted_text = ""
+        self.intake_validation = {}
+        self.requirement_text = ""
         self.fields = {}
         self.project_context_discovery = {}
         self.test_plan = ""
@@ -86,6 +110,7 @@ class TestWorkflowOrchestrator:
         self.codex_task = {}
         self.review_policy = "auto-review"
         self.review_result = {}
+        self.full_artifacts = False
 
     def _call_api(self, system_prompt: str, user_message: str,
                   temperature: float, max_tokens: int) -> str:
@@ -103,75 +128,56 @@ class TestWorkflowOrchestrator:
                 return block.text
         raise ValueError(f"No text block in response: {response.content}")
 
-    # ═══ Step 1: Boost Prompt ═══
-    def step_boost(self, raw_requirement: str) -> str:
-        """Step 1: Boost/optimize the rough test requirement."""
+    def step_validate_intake(self, raw_requirement: str) -> str:
+        """Step 0: Ask the model whether the input is actionable enough."""
         print("=" * 60)
-        print("[Step 1/9] 优化测试需求提示词...")
+        print("[Step 0/9] 校验测试需求是否足够明确...")
         print("=" * 60)
 
-        self.boosted_text = self._call_api(
-            system_prompt=SYSTEM_PROMPT_BOOST,
-            user_message=f"请帮我优化以下测试需求描述：\n\n{raw_requirement}",
-            temperature=BOOST_TEMPERATURE,
-            max_tokens=BOOST_MAX_TOKENS,
+        validation_json = self._call_api(
+            system_prompt=INTAKE_VALIDATION_SYSTEM_PROMPT,
+            user_message=raw_requirement,
+            temperature=0,
+            max_tokens=2048,
         )
-        print(f"\n{self.boosted_text}\n")
-        return self.boosted_text
+        self.intake_validation = self._ensure_dict(
+            self._parse_json(validation_json),
+            "intake_validation",
+        )
+        status = str(self.intake_validation.get("status", "")).strip().lower()
+        reason = self.intake_validation.get("reason", "")
+        questions = self.intake_validation.get("questions", [])
+        if isinstance(questions, str):
+            questions = [questions]
 
-    def step_review_boosted_requirement(self, raw_requirement: str,
-                                        output_dir: str = None) -> str:
-        """Review and optionally edit the boosted requirement before continuing."""
-        print("=" * 60)
-        print("[Step 1.5/9] 审查增强后的测试需求...")
-        print("=" * 60)
+        if status != "ready":
+            print("\n需求不明确，暂不继续生成测试计划。")
+            if reason:
+                print(f"原因: {reason}")
+            if questions:
+                print("需要补充:")
+                for index, question in enumerate(questions, start=1):
+                    print(f"{index}. {question}")
+            raise RuntimeError("Requirement needs clarification before pipeline generation.")
 
-        review_dir = self._create_boost_review_dir(raw_requirement, output_dir)
-        boosted_path = review_dir / "boosted_requirement.md"
-        html_path = review_dir / "index.html"
+        normalized = str(self.intake_validation.get("normalized_requirement") or "").strip()
+        if not normalized:
+            normalized = raw_requirement
+        print("\n需求校验通过，继续后续流程。")
+        if reason:
+            print(f"说明: {reason}")
+        return normalized
 
-        self._write_text(review_dir / "raw_requirement.txt", raw_requirement)
-        self._write_text(boosted_path, self.boosted_text)
-        self._write_text(html_path, self._build_html_viewer(review_dir))
-
-        print(f"\n增强需求审查目录: {review_dir}")
-        print(f"  - boosted_requirement.md: {boosted_path}")
-        print(f"  - index.html: {html_path}")
-        print("\n请先审查增强后的需求。")
-        print("输入 yes/继续: 使用当前 boosted_requirement.md 继续")
-        print("输入 edit/编辑: 先编辑 boosted_requirement.md，保存后再回到这里输入 yes/继续")
-        print("输入 no/取消: 停止 pipeline")
-
-        while True:
-            try:
-                answer = input("\n是否继续使用增强后的需求？").strip().lower()
-            except EOFError as exc:
-                raise RuntimeError("Boosted requirement review requires interactive confirmation.") from exc
-
-            if answer in {"yes", "y", "继续", "确认"}:
-                self.boosted_text = boosted_path.read_text(encoding="utf-8")
-                self._write_text(html_path, self._build_html_viewer(review_dir))
-                print("\n已确认增强需求，继续后续 pipeline。")
-                return self.boosted_text
-            if answer in {"edit", "编辑", "e"}:
-                print(f"\n请编辑并保存: {boosted_path}")
-                print(f"也可以打开浏览器查看: {html_path}")
-                print("编辑完成后回到这里输入 yes/继续。")
-                continue
-            if answer in {"no", "n", "取消", "stop", "停止"}:
-                raise RuntimeError("Pipeline stopped during boosted requirement review.")
-            print("请输入 yes/继续、edit/编辑 或 no/取消。")
-
-    # ═══ Step 2: Extract Fields ═══
+    # ═══ Step 1: Extract Fields ═══
     def step_extract_fields(self) -> dict:
-        """Step 2: Extract structured fields from boosted requirement."""
+        """Step 1: Extract structured fields from validated requirement context."""
         print("=" * 60)
-        print("[Step 2/9] 提取结构化字段...")
+        print("[Step 1/9] 提取结构化字段...")
         print("=" * 60)
 
         fields_json = self._call_api(
             system_prompt=EXTRACT_FIELDS_SYSTEM_PROMPT,
-            user_message=f"请从以下测试需求中提取字段：\n\n{self.boosted_text}",
+            user_message=f"请从以下测试需求中提取字段：\n\n{self.requirement_text}",
             temperature=0.2,
             max_tokens=2048,
         )
@@ -182,7 +188,7 @@ class TestWorkflowOrchestrator:
     def step_discover_project_context(self, raw_requirement: str) -> dict:
         """Discover existing project structure before generating plan and cases."""
         print("=" * 60)
-        print("[Step 2.5/9] Discovering existing project context...")
+        print("[Step 2/9] Discovering existing project context...")
         print("=" * 60)
 
         project_root = self._select_project_root(raw_requirement)
@@ -314,37 +320,19 @@ class TestWorkflowOrchestrator:
     def step_build_codex_handoff(self) -> dict:
         """Step 8: Build deterministic handoff artifacts for Codex/GPT-5.5."""
         print("=" * 60)
-        print("[Step 8/9] 生成 Codex handoff 任务包...")
+        print("[Step 8/9] 准备后台交接信息...")
         print("=" * 60)
 
         self.project_context_request = self._build_project_context_request()
         self.codex_task = self._build_codex_task_json()
-        print(json.dumps(self.codex_task, ensure_ascii=False, indent=2)[:800])
+        print("后台交接信息已准备。")
         return self.codex_task
 
     # ═══ Step 9: Save Output ═══
     def step_save_output(self, raw_requirement: str,
-                         output_dir: str = None) -> str:
-        """Step 9: Save all artifacts to a dedicated folder.
-
-        Creates: output/<feature>_<timestamp>/
-                   raw_requirement.txt
-                   boosted_requirement.md
-                   fields.json
-                   test_plan.md
-                   test_cases.md
-                   test_cases.json
-                   automation_request.json
-                   execution_request.json
-                   review_result.json
-                   review_notes.md
-                   project_context_discovery.md
-                   project_context_discovery.json
-                   project_context_request.json
-                   codex_task.json
-                   codex_task.md
-                   report.md
-        """
+                         output_dir: str = None,
+                         full_artifacts: bool = False) -> str:
+        """Step 9: Save artifacts to a readable workbench layout."""
         print("=" * 60)
         print("[Step 9/9] 保存输出文档...")
         print("=" * 60)
@@ -355,387 +343,63 @@ class TestWorkflowOrchestrator:
 
         base_dir = Path(output_dir) if output_dir else Path.cwd() / "output"
         run_dir = base_dir / folder_name
-        run_dir.mkdir(parents=True, exist_ok=True)
+        raw_dir = run_dir / "raw"
+        md_dir = run_dir / "md"
+        json_dir = run_dir / "json"
+        exports_dir = run_dir / "exports"
+        full_dir = run_dir / "full"
 
-        self._write_text(run_dir / "raw_requirement.txt", raw_requirement)
-        self._write_text(run_dir / "boosted_requirement.md", self.boosted_text)
-        self._write_json(run_dir / "fields.json", self.fields)
-        self._write_json(run_dir / "project_context_discovery.json", self.project_context_discovery)
-        self._write_text(run_dir / "project_context_discovery.md", self._build_project_context_discovery_markdown())
-        self._write_text(run_dir / "test_plan.md", self._build_test_plan_markdown())
-        self._write_text(run_dir / "test_cases.md", self._build_cases_markdown())
-        self._write_json(run_dir / "test_cases.json", self.test_cases)
-        self._write_json(run_dir / "automation_request.json", self.automation_request)
-        self._write_json(run_dir / "execution_request.json", self.execution_request)
-        self._write_json(run_dir / "review_result.json", self.review_result)
-        self._write_text(run_dir / "review_notes.md", self._build_review_notes_markdown())
-        self._write_json(run_dir / "project_context_request.json", self.project_context_request)
-        self._write_json(run_dir / "codex_task.json", self.codex_task)
-        self._write_text(run_dir / "codex_task.md", self._build_codex_task_markdown())
-        self._write_text(run_dir / "report.md", self._build_report_markdown(raw_requirement))
-        self._write_text(run_dir / "index.html", self._build_html_viewer(run_dir))
+        self._write_text(raw_dir / "raw_requirement.txt", raw_requirement)
+        self._write_text(md_dir / "requirement.md", self.requirement_text)
+        self._write_text(md_dir / "test_plan.md", self._build_test_plan_markdown())
+        self._write_text(md_dir / "test_cases.md", self._build_cases_markdown())
+        self._write_text(md_dir / "codex_task.md", self._build_codex_task_markdown())
+        self._write_text(md_dir / "report.md", self._build_report_markdown(raw_requirement))
+        write_test_cases_xlsx(exports_dir / "test_cases.xlsx", self.test_cases)
+        write_test_cases_xmind(exports_dir / "test_cases.xmind", self.test_cases)
+
+        self._write_json(json_dir / "automation_request.json", self.automation_request)
+        self._write_json(json_dir / "test_cases.json", self.test_cases)
+        self._write_json(json_dir / "execution_request.json", self.execution_request)
+        self._write_json(json_dir / "review_result.json", self.review_result)
+        self._write_text(md_dir / "review_notes.md", self._build_review_notes_markdown())
+
+        if full_artifacts:
+            self._write_json(full_dir / "fields.json", self.fields)
+            self._write_json(full_dir / "project_context_discovery.json", self.project_context_discovery)
+            self._write_text(full_dir / "project_context_discovery.md", self._build_project_context_discovery_markdown())
+            self._write_json(full_dir / "review_result.json", self.review_result)
+            self._write_text(full_dir / "review_notes.md", self._build_review_notes_markdown())
+            self._write_json(full_dir / "project_context_request.json", self.project_context_request)
+            self._write_json(full_dir / "codex_task.json", self.codex_task)
+
+        self._write_text(run_dir / "index.html", build_html_viewer(run_dir))
 
         print(f"\n输出目录: {run_dir}/")
-        print("  ├── raw_requirement.txt")
         print("  ├── index.html")
-        print("  ├── boosted_requirement.md")
-        print("  ├── fields.json")
-        print("  ├── project_context_discovery.md")
-        print("  ├── project_context_discovery.json")
-        print("  ├── test_plan.md")
-        print("  ├── test_cases.md")
-        print("  ├── test_cases.json")
-        print("  ├── automation_request.json")
-        print("  ├── execution_request.json")
-        print("  ├── review_result.json")
-        print("  ├── review_notes.md")
-        print("  ├── project_context_request.json")
-        print("  ├── codex_task.json")
-        print("  ├── codex_task.md")
-        print("  └── report.md")
+        print("  ├── raw/raw_requirement.txt")
+        print("  ├── md/requirement.md")
+        print("  ├── md/test_plan.md")
+        print("  ├── md/test_cases.md")
+        print("  ├── md/report.md")
+        print("  ├── exports/test_cases.xlsx")
+        print("  ├── exports/test_cases.xmind")
+        print("  └── json/ and md/codex_task.md (后台交接产物)")
+        if full_artifacts:
+            print("  └── full/ (审计和机器交接补充产物)")
         return str(run_dir)
 
     # ═══ Helpers ═══
     @staticmethod
     def _write_text(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
     @staticmethod
     def _write_json(path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _build_html_viewer(self, run_dir: Path) -> str:
-        """Build an offline HTML viewer for generated Markdown and JSON artifacts."""
-        files = [
-            ("Project Context Discovery", "project_context_discovery.md"),
-            ("报告", "report.md"),
-            ("测试方案", "test_plan.md"),
-            ("测试用例", "test_cases.md"),
-            ("审查说明", "review_notes.md"),
-            ("Codex 交接", "codex_task.md"),
-            ("增强需求", "boosted_requirement.md"),
-            ("原始需求", "raw_requirement.txt"),
-            ("结构化字段", "fields.json"),
-            ("结构化用例", "test_cases.json"),
-            ("实现请求", "automation_request.json"),
-            ("执行请求", "execution_request.json"),
-            ("审查结果", "review_result.json"),
-            ("Project Context Discovery JSON", "project_context_discovery.json"),
-            ("项目上下文请求", "project_context_request.json"),
-            ("Codex 任务 JSON", "codex_task.json"),
-        ]
-
-        nav_items = []
-        sections = []
-        for index, (title, filename) in enumerate(files, start=1):
-            path = run_dir / filename
-            if not path.exists():
-                continue
-            section_id = f"doc-{index}"
-            nav_items.append(
-                f'<a href="#{section_id}"><span>{html.escape(title)}</span><small>{html.escape(filename)}</small></a>'
-            )
-            content = path.read_text(encoding="utf-8")
-            if filename.endswith(".json"):
-                body = f"<pre><code>{html.escape(content)}</code></pre>"
-            else:
-                body = self._render_markdown_fragment(content)
-            sections.append(
-                f"""
-                <section id="{section_id}" class="doc-section">
-                  <div class="doc-heading">
-                    <p>{html.escape(filename)}</p>
-                    <h2>{html.escape(title)}</h2>
-                  </div>
-                  <div class="doc-body">{body}</div>
-                </section>
-                """
-            )
-
-        return f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>auto-test-flow 产物查看器</title>
-  <style>
-    :root {{
-      color-scheme: light;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --text: #1f2937;
-      --muted: #6b7280;
-      --line: #d8dee8;
-      --accent: #1769aa;
-      --accent-soft: #e8f2fb;
-      --code: #0f172a;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
-      line-height: 1.65;
-      color: var(--text);
-      background: var(--bg);
-    }}
-    .layout {{
-      display: grid;
-      grid-template-columns: 280px minmax(0, 1fr);
-      min-height: 100vh;
-    }}
-    nav {{
-      position: sticky;
-      top: 0;
-      height: 100vh;
-      overflow-y: auto;
-      padding: 24px 18px;
-      border-right: 1px solid var(--line);
-      background: #eef2f7;
-    }}
-    nav h1 {{
-      margin: 0 0 18px;
-      font-size: 20px;
-      line-height: 1.3;
-    }}
-    nav a {{
-      display: block;
-      padding: 10px 12px;
-      margin: 4px 0;
-      color: var(--text);
-      text-decoration: none;
-      border-radius: 8px;
-    }}
-    nav a:hover {{ background: var(--accent-soft); }}
-    nav span {{ display: block; font-weight: 650; }}
-    nav small {{ display: block; color: var(--muted); font-size: 12px; }}
-    main {{
-      width: min(1180px, 100%);
-      padding: 28px;
-    }}
-    .doc-section {{
-      margin: 0 0 28px;
-      padding: 28px;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-    }}
-    .doc-heading {{
-      margin-bottom: 22px;
-      padding-bottom: 14px;
-      border-bottom: 1px solid var(--line);
-    }}
-    .doc-heading p {{
-      margin: 0 0 4px;
-      color: var(--muted);
-      font-size: 13px;
-    }}
-    .doc-heading h2 {{
-      margin: 0;
-      font-size: 26px;
-      line-height: 1.25;
-    }}
-    h1, h2, h3, h4 {{ line-height: 1.35; }}
-    .doc-body h1 {{ font-size: 26px; margin: 24px 0 12px; }}
-    .doc-body h2 {{ font-size: 22px; margin: 22px 0 10px; }}
-    .doc-body h3 {{ font-size: 18px; margin: 18px 0 8px; }}
-    .doc-body h4 {{ font-size: 16px; margin: 16px 0 6px; }}
-    p {{ margin: 10px 0; }}
-    ul, ol {{ padding-left: 24px; }}
-    li {{ margin: 5px 0; }}
-    table {{
-      width: 100%;
-      margin: 16px 0;
-      border-collapse: collapse;
-      font-size: 14px;
-    }}
-    th, td {{
-      vertical-align: top;
-      padding: 10px 12px;
-      border: 1px solid var(--line);
-    }}
-    th {{
-      background: #f1f5f9;
-      text-align: left;
-      font-weight: 700;
-    }}
-    code {{
-      font-family: Consolas, "Cascadia Mono", monospace;
-      color: var(--code);
-      background: #eef2f7;
-      border-radius: 4px;
-      padding: 0 4px;
-    }}
-    pre {{
-      overflow-x: auto;
-      padding: 16px;
-      background: #111827;
-      color: #f9fafb;
-      border-radius: 8px;
-      line-height: 1.5;
-    }}
-    pre code {{
-      color: inherit;
-      background: transparent;
-      padding: 0;
-    }}
-    blockquote {{
-      margin: 14px 0;
-      padding: 8px 16px;
-      color: var(--muted);
-      border-left: 4px solid var(--accent);
-      background: #f8fafc;
-    }}
-    @media (max-width: 860px) {{
-      .layout {{ display: block; }}
-      nav {{
-        position: static;
-        height: auto;
-        border-right: 0;
-        border-bottom: 1px solid var(--line);
-      }}
-      main {{ padding: 16px; }}
-      .doc-section {{ padding: 18px; }}
-    }}
-  </style>
-</head>
-<body>
-  <div class="layout">
-    <nav>
-      <h1>auto-test-flow 产物</h1>
-      {''.join(nav_items)}
-    </nav>
-    <main>
-      {''.join(sections)}
-    </main>
-  </div>
-</body>
-</html>
-"""
-
-    def _render_markdown_fragment(self, text: str) -> str:
-        lines = text.splitlines()
-        html_parts = []
-        paragraph = []
-        list_stack = []
-        in_code = False
-        code_lines = []
-        i = 0
-
-        def flush_paragraph():
-            if paragraph:
-                html_parts.append(f"<p>{self._render_inline(' '.join(paragraph))}</p>")
-                paragraph.clear()
-
-        def close_lists():
-            while list_stack:
-                html_parts.append(f"</{list_stack.pop()}>")
-
-        while i < len(lines):
-            line = lines[i]
-            stripped = line.strip()
-
-            if stripped.startswith("```"):
-                flush_paragraph()
-                close_lists()
-                if in_code:
-                    html_parts.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
-                    code_lines = []
-                    in_code = False
-                else:
-                    in_code = True
-                i += 1
-                continue
-
-            if in_code:
-                code_lines.append(line)
-                i += 1
-                continue
-
-            if not stripped:
-                flush_paragraph()
-                close_lists()
-                i += 1
-                continue
-
-            if stripped.startswith("|") and i + 1 < len(lines) and self._is_markdown_table_separator(lines[i + 1]):
-                flush_paragraph()
-                close_lists()
-                table_lines = [stripped, lines[i + 1].strip()]
-                i += 2
-                while i < len(lines) and lines[i].strip().startswith("|"):
-                    table_lines.append(lines[i].strip())
-                    i += 1
-                html_parts.append(self._render_table(table_lines))
-                continue
-
-            heading = re.match(r"^(#{1,4})\s+(.+)$", stripped)
-            if heading:
-                flush_paragraph()
-                close_lists()
-                level = len(heading.group(1))
-                html_parts.append(f"<h{level}>{self._render_inline(heading.group(2))}</h{level}>")
-                i += 1
-                continue
-
-            if stripped.startswith(">"):
-                flush_paragraph()
-                close_lists()
-                html_parts.append(f"<blockquote>{self._render_inline(stripped.lstrip('> ').strip())}</blockquote>")
-                i += 1
-                continue
-
-            unordered = re.match(r"^[-*]\s+(.+)$", stripped)
-            ordered = re.match(r"^\d+\.\s+(.+)$", stripped)
-            if unordered or ordered:
-                flush_paragraph()
-                tag = "ul" if unordered else "ol"
-                if not list_stack or list_stack[-1] != tag:
-                    close_lists()
-                    list_stack.append(tag)
-                    html_parts.append(f"<{tag}>")
-                item = unordered.group(1) if unordered else ordered.group(1)
-                html_parts.append(f"<li>{self._render_inline(item)}</li>")
-                i += 1
-                continue
-
-            close_lists()
-            paragraph.append(stripped)
-            i += 1
-
-        flush_paragraph()
-        close_lists()
-        if in_code:
-            html_parts.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
-        return "\n".join(html_parts)
-
-    @staticmethod
-    def _is_markdown_table_separator(line: str) -> bool:
-        return bool(re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", line))
-
-    def _render_table(self, lines: list[str]) -> str:
-        header = self._split_table_row(lines[0])
-        body_rows = [self._split_table_row(line) for line in lines[2:]]
-        header_html = "".join(f"<th>{self._render_inline(cell)}</th>" for cell in header)
-        body_html = []
-        for row in body_rows:
-            cells = row + [""] * max(0, len(header) - len(row))
-            body_html.append("<tr>" + "".join(f"<td>{self._render_inline(cell)}</td>" for cell in cells[:len(header)]) + "</tr>")
-        return f"<table><thead><tr>{header_html}</tr></thead><tbody>{''.join(body_html)}</tbody></table>"
-
-    @staticmethod
-    def _split_table_row(line: str) -> list[str]:
-        return [cell.strip() for cell in line.strip().strip("|").split("|")]
-
-    @staticmethod
-    def _render_inline(text: str) -> str:
-        escaped = html.escape(text)
-        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
-        escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
-        escaped = escaped.replace("&lt;br&gt;", "<br>").replace("&lt;br/&gt;", "<br>").replace("&lt;br /&gt;", "<br>")
-        return escaped
-
-    @staticmethod
     def _extract_feature_name(text: str, max_len: int = 20) -> str:
         """Extract a short feature name from the raw requirement."""
         name = text.strip().split("\n")[0].strip()
@@ -745,26 +409,16 @@ class TestWorkflowOrchestrator:
         name = re.sub(r"[^\u4e00-\u9fff\w]", "_", name)
         return name[:max_len].strip("_") or "test_plan"
 
-    def _create_boost_review_dir(self, raw_requirement: str, output_dir: str = None) -> Path:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        feature_name = self._extract_feature_name(raw_requirement)
-        base_dir = Path(output_dir) if output_dir else Path.cwd() / "output"
-        review_dir = base_dir / f"_boost_review_{feature_name}_{timestamp}"
-        review_dir.mkdir(parents=True, exist_ok=True)
-        return review_dir
-
     def _select_project_root(self, raw_requirement: str) -> Path | None:
         """Pick the strongest local project root candidate without using the API."""
         candidates = []
         source_text = "\n".join([
             raw_requirement or "",
-            self.boosted_text or "",
+            self.requirement_text or "",
             json.dumps(self.fields, ensure_ascii=False),
         ])
 
-        for match in re.findall(r"[A-Za-z]:\\[^\r\n\"'<>|]+", source_text):
-            cleaned = match.strip().rstrip(".,;:，。；：)）]")
-            candidates.append(Path(cleaned))
+        candidates.extend(self._extract_path_candidates(source_text))
 
         cwd = Path.cwd()
         for base in [cwd, *cwd.parents]:
@@ -789,6 +443,42 @@ class TestWorkflowOrchestrator:
             return None
         scored.sort(key=lambda item: (item[0], len(str(item[1]))), reverse=True)
         return scored[0][1]
+
+    def _extract_path_candidates(self, text: str) -> list[Path]:
+        """Extract Windows path candidates and trim natural-language suffixes."""
+        candidates = []
+        for match in re.finditer(r"[A-Za-z]:\\[^\r\n\"'<>|]+", text or ""):
+            raw_candidate = match.group(0).strip().rstrip(".,;:，。；：)）]")
+            resolved = self._longest_existing_path_prefix(raw_candidate)
+            if resolved:
+                candidates.append(resolved)
+            else:
+                candidates.append(Path(raw_candidate))
+        return candidates
+
+    @staticmethod
+    def _longest_existing_path_prefix(raw_path: str) -> Path | None:
+        """Return the longest existing prefix from a path-like string."""
+        cleaned = raw_path.strip().rstrip(".,;:，。；：)）]")
+        if not cleaned:
+            return None
+        try:
+            if Path(cleaned).exists():
+                return Path(cleaned)
+        except OSError:
+            pass
+
+        min_len = 3  # e.g. C:\
+        for end in range(len(cleaned) - 1, min_len - 1, -1):
+            prefix = cleaned[:end].strip().rstrip(".,;:，。；：)）]")
+            if len(prefix) < min_len:
+                continue
+            try:
+                if Path(prefix).exists():
+                    return Path(prefix)
+            except OSError:
+                continue
+        return None
 
     @staticmethod
     def _normalize_project_root(path: Path) -> Path | None:
@@ -865,7 +555,7 @@ class TestWorkflowOrchestrator:
     def _derive_discovery_terms(self, raw_requirement: str) -> list[str]:
         source = "\n".join([
             raw_requirement or "",
-            self.boosted_text or "",
+            self.requirement_text or "",
             json.dumps(self.fields, ensure_ascii=False),
         ]).lower()
         terms = set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}", source))
@@ -1210,7 +900,8 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 要求：
 1. 项目上下文发现是文件结构、框架、已有测试逻辑和执行命令的事实来源。
 2. 测试方案必须复用已有测试结构，不能臆造与项目上下文冲突的页面对象、选择器、fixture、测试文件或命令。
-3. 如果需求与已有代码逻辑存在不确定点，请写入待确认问题，不要把假设写成确定预期。"""
+3. 如果输入材料已经明确给出测试点或测试用例，只围绕这些已明确内容输出；用户只指定其中一个功能点时，不要展开同一材料中的其他功能点。
+4. 如果需求与已有代码逻辑存在不确定点，请写入待确认问题，不要把假设写成确定预期。"""
 
     def _build_test_cases_user_prompt(self) -> str:
         """Build a project-aware user prompt for structured test cases."""
@@ -1228,7 +919,8 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 要求：
 1. 用例预期必须以项目上下文和已有代码逻辑为准。
 2. 不要因为常见直觉推翻已有测试逻辑；如果与直觉冲突，把原因写入 assumptions 或 need_confirmation。
-3. 不要输出要求新增未知测试文件、未知页面对象、未知 fixture 的用例前置条件。"""
+3. 如果输入材料已经明确给出测试点或测试用例，只生成这些已明确范围内的用例；不要扩展未指定功能点。
+4. 不要输出要求新增未知测试文件、未知页面对象、未知 fixture 的用例前置条件。"""
 
     def _build_automation_request_prompt(self) -> str:
         """Build a project-aware automation handoff prompt."""
@@ -1270,7 +962,8 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 要求：
 1. 优先使用 project_context_discovery.recommended_commands。
 2. 不要输出通用的 pytest tests/、npm test 等命令，除非项目上下文明确支持。
-3. 如果执行前需要登录账号、浏览器进程、环境变量或测试数据，写入 pre_run_checks。"""
+3. 如果执行前需要登录账号、浏览器进程、环境变量或测试数据，写入 pre_run_checks。
+4. 如果 automation_request.element_evidence_required 为 true，将“确认已完成 CDP/F12 元素证据采集”写入 pre_run_checks。"""
 
     def _build_review_result(self) -> dict:
         """Review artifacts with deterministic risk rules before Codex handoff."""
@@ -1301,7 +994,14 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
                 ))
 
         if self.project_context_discovery.get("status") == "discovered":
-            commands_text = "\n".join(str(item) for item in self.execution_request.get("commands", []))
+            command_values = []
+            for command_field in ("commands", "command_candidates"):
+                value = self.execution_request.get(command_field, [])
+                if isinstance(value, str):
+                    command_values.append(value)
+                elif isinstance(value, list):
+                    command_values.extend(str(item) for item in value)
+            commands_text = "\n".join(command_values)
             if "pytest tests/" in commands_text.replace("\\", "/"):
                 findings.append(self._finding(
                     "high",
@@ -1350,6 +1050,13 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
                 "target_type",
                 "自动化目标类型仍为 unknown。",
                 "Codex handoff 前应确认这是 Web UI、API、单元测试还是集成测试。",
+            ))
+        elif target_type == "web_ui" and not self.automation_request.get("element_evidence_required"):
+            findings.append(self._finding(
+                "medium",
+                "element_evidence",
+                "Web UI 自动化请求未显式声明 element_evidence_required。",
+                "Codex 写选择器、页面对象或 UI 流程前必须先采集或请求 CDP/F12 元素证据。",
             ))
 
         all_safety_text = "\n".join(
@@ -1447,8 +1154,8 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
             "phase": "Phase 2.6 Codex handoff",
             "status": "skipped_by_review_gate",
             "reason": self.review_result.get("summary", "Review gate blocked handoff."),
-            "review_result": "review_result.json",
-            "review_notes": "review_notes.md",
+            "review_result": "full/review_result.json",
+            "review_notes": "full/review_notes.md",
         }
 
     def _build_project_context_request(self) -> dict:
@@ -1506,7 +1213,7 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
             "status": "ready_for_codex_review",
             "owner_split": {
                 "deepseek": [
-                    "需求增强",
+                    "intake 校验",
                     "字段抽取",
                     "测试方案生成",
                     "测试用例结构化",
@@ -1515,6 +1222,7 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
                 ],
                 "codex_gpt_55": [
                     "读取项目上下文",
+                    "为 Web UI 元素采集或请求 CDP/F12 证据",
                     "制定代码修改计划",
                     "等待用户确认",
                     "修改自动化测试代码",
@@ -1523,20 +1231,36 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
                 ],
             },
             "source_artifacts": {
-                "raw_requirement": "raw_requirement.txt",
-                "boosted_requirement": "boosted_requirement.md",
-                "fields": "fields.json",
-                "project_context_discovery": "project_context_discovery.json",
-                "test_plan": "test_plan.md",
-                "test_cases_markdown": "test_cases.md",
-                "test_cases_json": "test_cases.json",
-                "automation_request": "automation_request.json",
-                "execution_request": "execution_request.json",
-                "project_context_request": "project_context_request.json",
+                "raw_requirement": "raw/raw_requirement.txt",
+                "requirement": "md/requirement.md",
+                "test_plan": "md/test_plan.md",
+                "test_cases_markdown": "md/test_cases.md",
+                "test_cases_json": "json/test_cases.json",
+                "automation_request": "json/automation_request.json",
+                "execution_request": "json/execution_request.json",
+                "report": "md/report.md",
+                "full_artifacts": "full/ (only when --full-artifacts is used)",
             },
             "selected_cases": selected_cases,
             "project_context_discovery": self.project_context_discovery,
             "project_context_request": self.project_context_request,
+            "element_evidence_gate": {
+                "required_for_web_ui": True,
+                "source": "CDP, browser inspection, or user-provided DevTools/F12 DOM",
+                "must_collect_before": [
+                    "新增或修改 selector",
+                    "新增或修改 page object 操作",
+                    "新增或修改 UI 点击/读取/断言流程",
+                ],
+                "must_present": [
+                    "元素用途",
+                    "最小 DOM/outerHTML 证据",
+                    "稳定属性",
+                    "点击/选择/保存前后的状态变化",
+                    "最终选择器和选择原因",
+                ],
+                "blocked_without_evidence": True,
+            },
             "confirmation_gate": {
                 "required": True,
                 "before_actions": [
@@ -1552,6 +1276,7 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
                     "修改原因",
                     "预计验证命令",
                     "环境和数据安全判断",
+                    "UI 元素证据状态（如涉及 Web UI）",
                 ],
             },
             "implementation_constraints": [
@@ -1559,9 +1284,10 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
                 "新增选择器优先补充到已有 selector 类中。",
                 "新增测试用例放到项目既有 testcases 目录中。",
                 "测试用例只编排流程和断言，页面细节放到 page object。",
+                "涉及 Web UI 元素时，未采集真实 DOM/状态变化证据前不得猜测 selector 或添加兜底逻辑。",
                 "不引入新测试框架，除非项目没有合适框架且用户确认。",
             ],
-            "next_agent_prompt_file": "codex_task.md",
+            "next_agent_prompt_file": "md/codex_task.md",
         }
 
     def _build_codex_task_markdown(self) -> str:
@@ -1577,9 +1303,10 @@ Codex handoff was skipped by the review gate.
 
 ## 下一步
 
-1. 读取 `review_notes.md`。
-2. 根据审查建议确认或调整 `test_cases.json`、`automation_request.json`、`execution_request.json`。
-3. 如确认可以继续，再使用 `--review-policy ask` 或 `--review-policy full-auto` 重新运行。
+1. 读取 `md/report.md`。
+2. 根据审查建议确认或调整 `json/test_cases.json`、`json/automation_request.json`、`json/execution_request.json`。
+3. 如使用了 `--full-artifacts`，可读取 `full/review_notes.md` 和 `full/review_result.json` 查看更完整审查信息。
+4. 如确认可以继续，再使用 `--review-policy ask` 或 `--review-policy full-auto` 重新运行。
 """
 
         return f"""# Codex Handoff Task
@@ -1592,14 +1319,14 @@ Codex handoff was skipped by the review gate.
 
 ## 必读产物
 
-- `test_cases.json`
-- `automation_request.json`
-- `execution_request.json`
-- `project_context_discovery.json`
-- `project_context_discovery.md`
-- `project_context_request.json`
-- `test_plan.md`
-- `test_cases.md`
+- `md/requirement.md`
+- `md/test_plan.md`
+- `md/test_cases.md`
+- `md/report.md`
+- `json/test_cases.json`
+- `json/automation_request.json`
+- `json/execution_request.json`
+- `raw/raw_requirement.txt`
 
 ## 修改前确认 Gate
 
@@ -1613,9 +1340,21 @@ Codex handoff was skipped by the review gate.
 
 只有用户明确说“可以修改”“确认修改”“按这个改”后，才能修改代码文件。
 
+## CDP 元素证据 Gate
+
+如果本任务涉及 Web UI 元素定位、点击、读取或断言，在输出代码修改计划前必须先完成或请求元素证据采集：
+
+1. 目标元素用途
+2. 最小 DOM/outerHTML 片段
+3. 稳定属性（如 id、name、value、role、aria-*、data-*、checked、selected、disabled、稳定 class）
+4. 点击、选择、保存或展开前后的状态变化
+5. 最终选择器和选择原因
+
+没有真实 DOM 和状态变化证据时，不得猜测选择器、隐藏 input、class 状态、可点击祖先或兜底选择器。
+
 ## DeepSeek 与 Codex 职责边界
 
-- DeepSeek 负责：需求增强、字段抽取、测试方案、结构化用例、自动化实现请求、执行请求。
+- DeepSeek 负责：需求 intake 校验、字段抽取、测试方案、结构化用例、自动化实现请求、执行请求。
 - Codex 负责：项目上下文读取、代码修改计划、自动化测试代码落地、测试执行、失败修复、最终报告。
 
 ## 当前测试设计摘要
@@ -1640,11 +1379,12 @@ Codex handoff was skipped by the review gate.
 
 ## 下一步建议
 
-1. 读取 `project_context_request.json`。
-2. 读取 `project_context_discovery.json` / `project_context_discovery.md`，确认 pipeline 已发现的项目结构和硬约束。
-3. 在目标项目中执行只读发现，复核测试框架、目录结构、页面对象、选择器、fixtures 和运行命令。
-4. 基于 `test_cases.json` 选择首批 P0/P1 自动化候选用例。
-5. 输出代码修改计划并等待用户确认。
+1. 读取 `md/test_plan.md`、`md/test_cases.md`、`json/automation_request.json` 和 `json/execution_request.json`。
+2. 在目标项目中执行只读发现，复核测试框架、目录结构、页面对象、选择器、fixtures 和运行命令。
+3. 基于 `json/test_cases.json` 选择首批 P0/P1 自动化候选用例。
+4. 如果运行时存在 `full/` 目录，可读取其中的 project context 和 review 补充产物。
+5. 如涉及 Web UI，先采集或请求 CDP/F12 元素证据，并输出元素证据表。
+6. 输出代码修改计划并等待用户确认。
 """
 
     def _build_review_notes_markdown(self) -> str:
@@ -1778,39 +1518,29 @@ Codex handoff was skipped by the review gate.
 
 ## 已完成
 
-- 已保存原始需求和增强后的需求描述。
+- 已保存原始需求和校验后的需求上下文。
 - 已抽取结构化字段。
 - 已生成测试方案。
-- 已生成独立的结构化测试用例。
-- 已生成自动化脚本实现请求，作为后续项目代码生成节点的输入。
-- 已生成测试执行请求，作为后续执行和报告节点的输入。
-- 已完成自动审查，并生成 review_result.json 与 review_notes.md。
-- 已生成 Codex handoff 任务包，作为 GPT-5.5 代码落地阶段的输入。
+- 已生成测试用例，并导出 Markdown、Excel、XMind 三种查看格式。
+- 已在后台准备自动化实现请求、执行请求和 Codex 交接材料，用于后续无感执行。
+- 已完成自动审查；如使用 `--full-artifacts`，会额外保存审计补充产物。
 
 ## 产物清单
 
-- `raw_requirement.txt`
-- `boosted_requirement.md`
-- `fields.json`
-- `test_plan.md`
-- `test_cases.md`
-- `test_cases.json`
-- `automation_request.json`
-- `execution_request.json`
-- `review_result.json`
-- `review_notes.md`
-- `project_context_discovery.json`
-- `project_context_discovery.md`
-- `project_context_request.json`
-- `codex_task.json`
-- `codex_task.md`
-- `report.md`
+- `index.html`
+- `raw/raw_requirement.txt`
+- `md/requirement.md`
+- `md/test_plan.md`
+- `md/test_cases.md`
+- `md/report.md`
+- `exports/test_cases.xlsx`
+- `exports/test_cases.xmind`
 
 ## 当前边界
 
 - 本阶段不直接修改被测项目代码。
 - 本阶段不真实执行测试。
-- 自动化代码生成、项目发现、测试执行和失败修复由 Codex handoff 阶段接入。
+- 自动化代码生成、项目发现、测试执行和失败修复由后台 Codex 交接阶段接入。
 - Codex 修改任何代码前仍必须先输出修改计划并等待用户确认。
 
 ## 需要确认的问题
@@ -1838,27 +1568,28 @@ Codex handoff was skipped by the review gate.
 
     # ═══ Main Pipeline ═══
     def run(self, raw_requirement: str, output_dir: str = None,
-            skip_boost: bool = False, review_policy: str = "auto-review") -> str:
+            review_policy: str = "auto-review",
+            full_artifacts: bool = False, serve: bool = False,
+            port: int = 8765) -> str:
         """Execute the full Phase 2.6 pipeline."""
         if review_policy not in REVIEW_POLICIES:
             raise ValueError(f"Unsupported review policy: {review_policy}")
         self.review_policy = review_policy
+        self.full_artifacts = full_artifacts
 
         print(f"\n{'=' * 60}")
         print("  自动化测试工作流 (Phase 2.6)")
         print(f"  审查策略: {self.review_policy}")
+        print(f"  全量产物: {'是' if full_artifacts else '否'}")
         print(f"  输入: {raw_requirement[:50]}{'...' if len(raw_requirement) > 50 else ''}")
         print(f"{'=' * 60}\n")
 
         try:
-            if not skip_boost:
-                self.step_boost(raw_requirement)
-                self.step_review_boosted_requirement(raw_requirement, output_dir)
-            else:
-                self.boosted_text = raw_requirement
+            original_requirement = raw_requirement
+            self.requirement_text = self.step_validate_intake(raw_requirement)
 
             self.step_extract_fields()
-            self.step_discover_project_context(raw_requirement)
+            self.step_discover_project_context(original_requirement)
             self.step_generate_test_plan()
             self.step_generate_test_cases()
             self.step_build_automation_request()
@@ -1868,16 +1599,34 @@ Codex handoff was skipped by the review gate.
                 self.step_build_codex_handoff()
             else:
                 self._set_skipped_codex_handoff()
-            result_dir = self.step_save_output(raw_requirement, output_dir)
+            result_dir = self.step_save_output(original_requirement, output_dir, full_artifacts=full_artifacts)
 
             print(f"\n{'=' * 60}")
             print("  工作流完成!")
             print(f"{'=' * 60}")
+            if serve:
+                self._serve_output(Path(result_dir), port)
             return result_dir
 
         except Exception as e:
             print(f"\n[ERROR] 工作流执行失败: {e}", file=sys.stderr)
             raise
+
+    @staticmethod
+    def _serve_output(run_dir: Path, port: int) -> None:
+        """Serve a generated output folder as a local read-only workbench."""
+        handler = functools.partial(
+            http.server.SimpleHTTPRequestHandler,
+            directory=str(run_dir),
+        )
+        with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
+            url = f"http://127.0.0.1:{port}/"
+            print(f"\n本地查看服务已启动: {url}")
+            print("按 Ctrl+C 停止服务。")
+            try:
+                httpd.serve_forever()
+            except KeyboardInterrupt:
+                print("\n本地查看服务已停止。")
 
 
 def main():
@@ -1889,8 +1638,9 @@ def main():
   python orchestrator.py "对登录页面进行功能测试"
   python orchestrator.py --file requirements.txt
   python orchestrator.py "测试注册功能" --output-dir ./output
-  python orchestrator.py --file req.txt --skip-boost
   python orchestrator.py "测试登录功能" --review-policy ask
+  python orchestrator.py "测试登录功能" --serve --port 8765
+  python orchestrator.py "测试登录功能" --full-artifacts
         """,
     )
     group = parser.add_mutually_exclusive_group(required=True)
@@ -1899,11 +1649,15 @@ def main():
 
     parser.add_argument("-o", "--output-dir", default=None,
                         help="输出根目录(可选，默认当前目录下的 output/)")
-    parser.add_argument("--skip-boost", action="store_true",
-                        help="跳过提示词优化步骤")
     parser.add_argument("--review-policy", choices=REVIEW_POLICIES,
                         default="auto-review",
                         help="审查策略: ask=命令行确认, auto-review=自动审查并阻塞高风险, full-auto=不阻塞")
+    parser.add_argument("--full-artifacts", action="store_true",
+                        help="额外生成 full/ 审计和机器交接补充产物")
+    parser.add_argument("--serve", action="store_true",
+                        help="生成完成后启动本地 HTTP 服务查看 index.html")
+    parser.add_argument("--port", type=int, default=8765,
+                        help="--serve 使用的本地端口，默认 8765")
 
     args = parser.parse_args()
 
@@ -1920,8 +1674,10 @@ def main():
     orchestrator.run(
         raw_requirement=requirement.strip(),
         output_dir=args.output_dir,
-        skip_boost=args.skip_boost,
         review_policy=args.review_policy,
+        full_artifacts=args.full_artifacts,
+        serve=args.serve,
+        port=args.port,
     )
 
 

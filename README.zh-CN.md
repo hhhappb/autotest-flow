@@ -1,44 +1,47 @@
 # auto-test-flow
 
-版本：`v0.4`
+版本：`v0.5`
 
 [English README](README.md)
 
-`auto-test-flow` 是一个用于 QA 自动化流程的 agent skill。它可以把粗略测试需求转换成增强后的需求、结构化测试方案、测试用例、自动化实现请求，以及可交给 Codex 的代码落地任务。
+`auto-test-flow` 是一个用于 QA 自动化流程的 agent skill。它可以把粗略测试需求和本地需求材料转换成已校验的需求上下文、结构化测试方案、测试用例、导出文件、自动化实现请求，以及可交给 Codex 的代码落地任务。
 
-当前版本重点是 **双模式 QA 工作流**：
+当前版本重点是 **本地工作台 + 更安全的 UI 自动化交接**：
 
 - Inline 模式用于在对话中快速产出需求分析、测试设计和实现计划草稿。
-- Pipeline 模式用于把同一套流程落盘成可审计的 Markdown 和 JSON 产物。
+- Pipeline 模式用于把同一套流程落盘成更清晰的可审计产物。
+- Workbench 模式提供本地浏览器控制台，用于输入需求、上传附件、查看报告，并可选择交给 Codex。
 - DeepSeek v4-pro 负责需求分析和结构化测试产物。
-- pipeline 会在需求增强后暂停，允许用户审查或编辑增强需求，再继续生成后续产物。
-- 在生成测试方案前，pipeline 会先发现本地项目已有结构，并把这些上下文注入后续 prompt。
-- review policy gate 在交给 Codex 前审查生成结果。
-- 每次 pipeline 会生成离线 `index.html` 查看页，方便在浏览器中阅读 Markdown 和 JSON 产物。
-- Codex/GPT-5.5 接收专门的 handoff 任务包，负责项目发现、代码修改计划、测试实现、执行与修复。
+- pipeline 在生成后续 prompt 前会先发现本地项目已有结构。
+- Web UI 自动化在修改 selector、page object、点击、读取或断言逻辑前，必须先有 CDP/F12 元素证据。
+- 每次运行会生成 `index.html`、Markdown 报告、Excel/XMind 导出、JSON 交接文件，以及可选的 full 审计产物。
+- Codex 接收专门的 handoff 任务包，负责项目发现、代码修改计划、测试实现、执行与修复。
 - pipeline 本身不会修改项目代码，也不会真实执行测试。
 
 ## 能力概览
 
-- 将粗略测试需求增强为结构化测试 brief。
-- 从增强需求中抽取机器可读字段。
+- 将粗略测试需求整理为结构化测试 brief。
+- 读取通过工作台提供的本地材料，包括图片、`.xlsx`、`.csv`、`.txt` 和 `.md`。
+- 从需求中抽取机器可读字段。
+- 发现本地项目上下文，并注入后续 prompt。
 - 生成可读的测试方案。
 - 生成 Markdown 和 JSON 两种形式的结构化测试用例。
+- 导出 `.xlsx` 和 `.xmind` 测试用例文件。
 - 生成自动化实现请求和执行请求。
-- 在生成测试方案和用例前，允许用户确认或编辑增强后的需求。
 - 通过 `auto-review`、`ask`、`full-auto` 三种策略审查产物。
 - 生成 Codex handoff 产物，用于后续测试代码落地。
-- 生成离线 HTML 查看页，便于浏览器阅读产物。
-- 保留明确的用户确认 gate，避免未经确认修改项目代码。
+- 在 `127.0.0.1` 启动本地工作台。
+- 保留明确的用户确认 gate 和 UI 元素证据 gate，避免未经确认或缺少真实 DOM 证据就修改项目代码。
 
-## Inline 与 Pipeline
+## Inline、Pipeline 与 Workbench
 
-`auto-test-flow` 有两种模式。Inline 是 Pipeline 的轻量草稿版。Inline 不代表可以跳过需求分析或测试用例设计，只是把产物直接输出在对话里，而不是写入文件。
+`auto-test-flow` 有三种操作入口。Inline 是轻量草稿版，Pipeline 负责写入可复用产物，Workbench 把 pipeline 包装成本地页面。
 
 | 模式 | 适合场景 | 输出形式 | 门禁 |
 |---|---|---|---|
 | Inline | 快速探索、早期需求澄清、快速测试设计 | 对话输出：增强需求、假设、测试范围、测试点、用例表、实现计划、待确认问题 | 修改代码前仍需用户确认 |
-| Pipeline | 正式评审、复用产物、审计留痕、多人交接 | 文件输出：`boosted_requirement.md`、`test_plan.md`、`test_cases.md`、JSON 产物、review notes、Codex handoff 包、`index.html` 查看页 | 增强需求审查、review policy gate + 修改代码前用户确认 |
+| Pipeline | 正式评审、复用产物、审计留痕、多人交接 | 运行目录：`md/`、`json/`、`exports/`、`raw/`、`index.html` | review policy gate + 修改代码前用户确认 |
+| Workbench | 本地页面操作、附件上传、报告预览、可选 Codex 执行 | 本地页面：`http://127.0.0.1:8765/` | 与命令行相同的确认和证据门禁 |
 
 Inline 最少应该输出：
 
@@ -47,15 +50,15 @@ Inline 最少应该输出：
 3. 测试范围
 4. 测试点拆解
 5. 带优先级的测试用例表
-6. 自动化实现计划
-7. 如果涉及代码实现，列出拟修改文件、修改原因和验证命令
+6. UI 工作涉及的元素证据计划或已采集证据摘要
+7. 自动化实现计划
+8. 如果涉及代码实现，列出拟修改文件、修改原因、数据/环境影响和验证命令
 
 Pipeline 会把同一套概念流程持久化：
 
 ```text
 原始需求
-  -> 增强需求
-  -> 增强需求审查/编辑 gate
+  -> 需求 intake 校验
   -> 结构化字段
   -> 项目上下文发现
   -> 测试方案
@@ -63,7 +66,7 @@ Pipeline 会把同一套概念流程持久化：
   -> 自动化实现和执行请求
   -> review gate
   -> Codex handoff
-  -> 报告
+  -> 报告和导出文件
 ```
 
 ### Inline 晋升为 Pipeline
@@ -78,6 +81,7 @@ Inline 可以晋升为 Pipeline。如果用户在 Inline 阶段补充、确认�
 - 用户否定的假设或排除范围
 - 已选择的测试范围和测试点拆解
 - 测试用例表
+- 元素证据计划或证据摘要
 - 自动化实现说明
 - 待确认问题
 
@@ -87,14 +91,25 @@ Inline 可以晋升为 Pipeline。如果用户在 Inline 阶段补充、确认�
 skills/
   auto-test-flow/
     SKILL.md
+    assets/
+      workbench.html
+      workbench.css
+      workbench.js
     references/
-      evaluation-prompts.md
+      automation-code-rules.md
+      element-evidence-cdp.md
       framework-guidance.md
       hybrid-ui-automation-project-guide.md
+      local-viewer.md
+      pipeline-artifacts.md
       test-requirement-template.md
     scripts/
       config.py
+      element_evidence.py
+      exporters.py
       orchestrator.py
+      viewer.py
+      workbench.py
       templates/
         test_plan_prompt.py
 ```
@@ -111,7 +126,7 @@ python "$env:USERPROFILE\.codex\skills\.system\skill-installer\scripts\install-s
 
 ## API 配置
 
-pipeline 使用 Anthropic-compatible API。默认配置面向 DeepSeek：
+pipeline 使用 Anthropic-compatible API。默认配置面向 DeepSeek。
 
 如果本地还没有 Python client，请先安装：
 
@@ -127,28 +142,49 @@ $env:ANTHROPIC_MODEL="deepseek-v4-pro"
 
 不要提交 API Key、账号数据、内部地址或生产配置。
 
+## 本地工作台用法
+
+当你想用浏览器页面输入需求、上传本地材料、查看生成报告，并可选择交给 Codex 时，使用本地工作台。
+
+从这个仓库启动：
+
+```powershell
+cd C:\Users\admin1\Desktop\copy\autotest-flow
+python .\skills\auto-test-flow\scripts\workbench.py --project-root C:\Users\admin1\Desktop\copy\auto-test --output-dir C:\Users\admin1\Desktop\copy\output --port 8765 --open-browser
+```
+
+如果 skill 已安装到全局 `.agents`：
+
+```powershell
+cd C:\Users\admin1\Desktop\copy
+.\auto-test\venv\Scripts\python.exe C:\Users\admin1\.agents\skills\auto-test-flow\scripts\workbench.py --project-root C:\Users\admin1\Desktop\copy\auto-test --output-dir C:\Users\admin1\Desktop\copy\output --port 8765 --open-browser
+```
+
+然后打开：
+
+```text
+http://127.0.0.1:8765/
+```
+
+如果 `8765` 端口被占用，把 `--port 8765` 改成其他端口，例如 `--port 8766`，然后打开 `http://127.0.0.1:8766/`。
+
+工作台可以：
+
+- 输入原始测试需求。
+- 上传图片、`.xlsx`、`.csv`、`.txt`、`.md` 等本地材料。
+- 运行 `orchestrator.py`。
+- 预览生成的运行目录。
+- 将 `md/codex_task.md` 交给 Codex，以只读提案模式或确认后的执行模式继续。
+- 执行命令时把日志保存在运行目录下。
+
 ## Pipeline 用法
 
-运行 Phase 2.6 pipeline：
+运行 pipeline：
 
 ```powershell
 cd skills\auto-test-flow\scripts
 python orchestrator.py "测试登录页面，覆盖正确账号登录、错误密码、账号为空、重复提交和权限不足场景"
 ```
-
-boost 步骤结束后，pipeline 会先生成一个审查目录：
-
-```text
-raw_requirement.txt
-boosted_requirement.md
-index.html
-```
-
-请先审查增强后的需求，再决定是否继续：
-
-- 输入 `yes` 或 `继续`：使用当前 `boosted_requirement.md` 继续。
-- 输入 `edit` 或 `编辑`：先编辑 `boosted_requirement.md`，保存后回到终端输入 `yes` 或 `继续`。
-- 输入 `no` 或 `取消`：在生成测试方案和用例前停止。
 
 指定输出目录：
 
@@ -170,6 +206,18 @@ python orchestrator.py "测试登录页面" --review-policy ask
 python orchestrator.py "测试登录页面" --review-policy full-auto
 ```
 
+生成完成后启动本地查看服务：
+
+```powershell
+python orchestrator.py "测试登录页面" --serve --port 8765
+```
+
+生成默认精简产物，同时额外保留完整审计和机器交接产物：
+
+```powershell
+python orchestrator.py "测试登录页面" --full-artifacts
+```
+
 ## 审查策略
 
 | 策略 | 行为 |
@@ -187,28 +235,43 @@ python orchestrator.py "测试登录页面" --review-policy full-auto
 ```text
 output/
   <feature>_<timestamp>/
-    raw_requirement.txt
     index.html
-    boosted_requirement.md
-    fields.json
-    project_context_discovery.md
-    project_context_discovery.json
-    test_plan.md
-    test_cases.md
-    test_cases.json
-    automation_request.json
-    execution_request.json
-    review_result.json
-    review_notes.md
-    project_context_request.json
-    codex_task.json
-    codex_task.md
-    report.md
+    raw/
+      raw_requirement.txt
+    md/
+      requirement.md
+      test_plan.md
+      test_cases.md
+      report.md
+      codex_task.md
+    exports/
+      test_cases.xlsx
+      test_cases.xmind
+    json/
+      test_cases.json
+      automation_request.json
+      execution_request.json
+      codex_task.json
+    attachments/            # 工作台上传附件时出现
+    logs/                   # 执行命令时出现
+    full/                   # 仅使用 --full-artifacts 时出现
 ```
 
-可以在浏览器中打开 `index.html`，用导航和表格渲染查看生成的 Markdown / JSON 产物。
+可以在浏览器中打开 `index.html`，查看面向人工阅读的 Markdown 和导出文件。JSON 和 Codex handoff 文件仍保留在磁盘上，供自动化和排查使用，但不再作为主要人工审查入口。
 
-`codex_task.md` 和 `codex_task.json` 是交给 Codex/GPT-5.5 的任务包。Codex 应先读取项目、提出代码修改计划、等待用户确认，然后才能修改测试代码。
+`md/codex_task.md` 和 `json/codex_task.json` 是交给 Codex 的任务包。Codex 应先读取项目，必要时采集 UI 元素证据，提出代码修改计划，等待用户确认，然后才能修改测试代码。
+
+## UI 元素证据 Gate
+
+Web UI 自动化不要猜选择器。新增或修改 selector、page object 操作、点击、读取、断言或测试流程前，需要采集或请求紧凑证据：
+
+- 元素用途
+- 最小 DOM 或 `outerHTML`
+- 稳定属性，例如 `id`、`name`、`value`、`role`、`aria-*`、`data-*`、checked/selected/disabled 状态或稳定 class
+- 点击、选择、保存或展开前后的状态变化
+- 最终选择器和稳定性理由
+
+内置的 `scripts/element_evidence.py` 可以扫描 live Playwright page，并格式化 selector 证据表。
 
 ## 在 Codex 或 Claude Code 中使用
 
@@ -218,7 +281,7 @@ output/
 使用 auto-test-flow，帮我为这个登录需求设计测试用例，并生成 Codex handoff 任务包。
 ```
 
-如果只是轻量设计，agent 可以直接在对话中输出方案，但仍应展示需求分析、测试范围、测试点、用例表、实现计划和待确认问题。如果需要可审计、可落盘的产物，就让它运行 pipeline，或把最新 Inline 草稿晋升为 pipeline 产物。
+如果只是轻量设计，agent 可以直接在对话中输出方案，但仍应展示需求分析、测试范围、测试点、用例表、实现计划、证据状态和待确认问题。如果需要可审计、可落盘的产物，就让它运行 pipeline，或把最新 Inline 草稿晋升为 pipeline 产物。
 
 ## 安全规则
 
@@ -227,21 +290,21 @@ output/
 - 如果项目已有合适测试框架，不要引入新框架。
 - 有 page object 和 selector 的项目，页面操作放在 page object，元素定位放在 selector 类。
 - 测试用例只编排流程和断言，避免堆叠页面细节。
-- 修改代码前必须先列出目标文件、修改点、原因和验证命令，并等待用户明确确认。
+- 修改代码前必须先列出目标文件、修改点、原因、数据/环境影响和验证命令，并等待用户明确确认。
+- Web UI selector 或 page object 修改前，必须采集真实 CDP/F12/live DOM 元素证据。
 
 ## 版本
 
-当前版本：`v0.4`
+当前版本：`v0.5`
 
 本版本重点：
 
-- 明确 Inline 与 Pipeline 的模式差异。
-- 增加 Inline 晋升 Pipeline 的规则。
-- 增加增强需求审查/编辑 gate，避免 boost 后直接生成下游产物。
-- 增加测试方案生成前的项目上下文发现，先读取已有代码结构、框架信号、相关文件和推荐命令。
-- 增加项目结构约束，减少臆造文件、类、选择器、fixture 和通用运行命令。
-- Phase 2.6 pipeline 编排。
-- 增加离线 HTML 产物查看页。
-- 基于 DeepSeek 的测试分析。
-- Codex handoff 前的 review policy gate。
-- 面向 Codex/GPT-5.5 的代码落地交接产物。
+- 新增本地浏览器工作台，用于输入需求、上传本地材料、查看生成结果，并可选择交给 Codex。
+- 增加打开 `http://127.0.0.1:8765/` 的工作台启动说明。
+- 默认产物结构改为更清晰的 `md/`、`json/`、`exports/`、`raw/`。
+- 新增 Excel 和 XMind 测试用例导出。
+- 支持 `--serve --port` 本地查看服务。
+- 支持 `--full-artifacts` 保留完整审计产物。
+- 增加 CDP/F12 元素证据 gate，约束 Web UI 自动化不要猜 selector。
+- 增强测试范围控制，避免用户只指定一个测试点时扩展同一材料里的无关功能。
+- 在自动化规划前继续优先检查已有项目约定。

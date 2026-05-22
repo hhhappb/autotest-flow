@@ -1,264 +1,186 @@
 ---
 name: auto-test-flow
-description: End-to-end QA automation workflow for turning rough testing requirements into refined prompts, structured test plans, test case tables, and executable automated test scripts. Use this skill whenever the user mentions testing requirements, test plans, test cases, QA, automated testing, E2E tests, UI tests, API tests, Playwright, Pytest, Cypress, regression testing, or asks to generate/run/fix test scripts, even if they only provide a short or vague Chinese/English request.
+description: End-to-end QA automation workflow for turning raw testing requirements and local materials into validated requirement context, structured test plans, test case tables, element-evidence discovery, and executable automated test scripts. Use this skill whenever the user mentions testing requirements, test plans, test cases, QA, automated testing, E2E tests, UI tests, API tests, Playwright, Pytest, Cypress, regression testing, CDP/F12 element evidence, selector confirmation, or asks to generate/run/fix test scripts, even if the request is short or vague.
 ---
 
 # Auto Test Flow
 
-Use this skill to act as a senior QA automation engineer. Take a rough testing request, refine it into a clear test requirement, design the test plan and cases, then implement and verify automation code when the user wants scripts or when the task clearly implies code generation.
+Use this skill as the coordinator for QA automation work. Keep the main flow short and load the referenced guides only when the current stage needs them.
 
 ## Operating Principles
 
-- Prefer action over long planning. If the user asks to build or generate tests, inspect the project and implement the tests.
-- Keep the workflow auditable: separate requirement refinement, test design, code generation, execution, and report.
-- Ask only the minimum blocking questions. If a detail can be reasonably inferred, proceed and list it under "Assumptions" or "Need Confirmation".
-- Use existing project conventions first: test framework, file layout, fixtures, page objects, naming, scripts, environment variables, and assertion style.
-- Do not introduce a new test framework if the repo already has a suitable one.
-- Do not run destructive tests against production data. If environment safety is unclear, ask before executing state-changing flows.
+- Preserve the user's business intent and expose assumptions early.
+- Follow existing project conventions before proposing new framework, directory, selector, fixture, runner, or report patterns.
+- Keep implementation small: first automate the highest-value P0/P1 path, then expand only when requested or justified by risk.
+- For UI automation, do not guess selectors. Element evidence from CDP, DevTools/F12, or an equivalent live DOM inspection is a gate before selector, page-object, or test-flow changes.
+- Before modifying code, selectors, page objects, test data, or test flow, list target files, intended changes, reasons, data/environment impact, and validation commands, then wait for explicit user confirmation.
 
-## Two Modes
+## Reference Map
 
-This skill supports two modes. Choose based on whether the user wants a quick design answer or saved workflow artifacts. Both modes must preserve the same QA workflow shape: requirement refinement, test design, automation planning, user confirmation, implementation, execution, and report. Inline mode is the lightweight draft version of Pipeline mode, not permission to skip requirement analysis or test case design.
+Read only the references needed for the current stage:
 
-**Inline mode** (default, lightweight): Generate the refined requirement, test scope, test point breakdown, test case table, automation implementation plan, and need-confirmation questions directly in conversation. Fast, no files written. Good for quick exploration, early requirement shaping, or when the user wants to see the plan before creating files.
+- `references/test-requirement-template.md`: Chinese requirement refinement structure.
+- `references/framework-guidance.md`: choose implementation style by framework.
+- `references/element-evidence-cdp.md`: CDP/F12 DOM evidence gate before UI selector or page-object work.
+- `references/automation-code-rules.md`: project code layering, selectors, assertions, Allure, cleanup, and confirmation rules.
+- `references/pipeline-artifacts.md`: pipeline output files, handoff fields, and report expectations.
+- `references/local-viewer.md`: local clickable artifact viewer, interactive workbench, and optional Codex execution handoff.
+- `references/hybrid-ui-automation-project-guide.md`: Python/Pytest + Playwright/Pywinauto/Electron project conventions.
+- `references/evaluation-prompts.md`: evaluate generated plans or code-level results.
 
-**Pipeline mode** (persistent, auditable): Run the bundled `scripts/orchestrator.py` to produce standardized Markdown and JSON artifacts. The Phase 2.6 pipeline turns a rough requirement into a saved handoff package for later Codex/GPT-5.5 automation implementation and execution. After boosting the raw requirement, the pipeline pauses for the user to review or edit `boosted_requirement.md`; the confirmed boosted requirement becomes the source of truth for later artifacts. Before generating the test plan, it discovers the existing local project structure and injects that context into the plan, case, automation request, and execution request prompts. A separate review policy gate still runs before Codex handoff. Use this when the user:
-- Wants a saved `.md` test plan file for review/sharing
-- Needs intermediate artifacts (boosted requirement, structured fields JSON, structured cases JSON)
-- Asks for "输出文件" or "保存方案" or "生成文档"
-- Is working in a regulated/auditable context
+## Modes
 
-Inline mode minimum output:
+### Inline Mode
 
-1. Refined requirement
-2. Assumptions and need-confirmation questions
-3. Test scope
-4. Test point breakdown
-5. Test case table with priority
-6. Automation implementation plan
-7. Proposed code-change files, reasons, and validation commands when code is requested
+Use this by default for quick progress in chat. Produce:
 
-Do not jump from a rough testing request directly to code discovery or code-change planning unless the user explicitly asks for a quick repository diagnosis only.
+1. Refined requirement.
+2. Assumptions and need-confirmation questions.
+3. Test scope.
+4. Test point breakdown.
+5. Test case table with priority.
+6. Element evidence plan or collected evidence summary for UI work.
+7. Automation implementation plan.
+8. Proposed code-change files, reasons, data/environment impact, and validation commands when code is requested.
 
-### Inline To Pipeline Promotion
+Do not jump from a rough requirement directly to code. If UI elements are unclear, stop at the element-evidence request instead of inventing selectors.
 
-Treat Inline mode as the draft layer for Pipeline mode. If the user edits, confirms, rejects, or expands an inline requirement, test plan, or test case table, preserve the latest inline version as the canonical draft.
+### Pipeline Mode
 
-When the user later asks to enter pipeline mode, generate files, save the plan, create formal artifacts, or produce a Codex handoff package, promote the latest inline draft into Pipeline mode instead of restarting from the original raw request.
+Use `scripts/orchestrator.py` when the user wants saved artifacts, a formal handoff package, or repeatable pipeline output. The pipeline creates a run folder under `output/<feature>_<timestamp>/`.
 
-The promoted Pipeline input must include:
+Run from the skill's `scripts` directory:
 
-- Original raw requirement
-- Latest refined requirement
-- User-confirmed assumptions
-- User-rejected assumptions or scope exclusions
-- Selected test scope
-- Test point breakdown
-- Test case table
-- Automation implementation notes
-- Need-confirmation questions
-
-Do not discard inline changes during promotion.
-
-The pipeline creates a dedicated folder per run under the current working directory:
-```
-output/
-  <feature>_<timestamp>/
-    raw_requirement.txt         # Original user requirement
-    boosted_requirement.md      # Refined requirement
-    fields.json                 # Structured fields (machine-readable)
-    project_context_discovery.md # Discovered local project structure and hard constraints
-    project_context_discovery.json # Machine-readable discovered project context
-    test_plan.md                # Human-readable test plan
-    test_cases.md               # Human-readable test case table
-    test_cases.json             # Structured test cases (machine-readable)
-    automation_request.json     # Handoff request for future code generation
-    execution_request.json      # Handoff request for future test execution
-    review_result.json          # Machine-readable review decision and findings
-    review_notes.md             # Human-readable review notes
-    project_context_request.json # Project discovery request for Codex
-    codex_task.json             # Machine-readable Codex handoff task
-    codex_task.md               # Human-readable Codex handoff prompt
-    report.md                   # Phase summary and remaining questions
+```bash
+python orchestrator.py "<raw testing requirement>"
+python orchestrator.py "<raw testing requirement>" --review-policy ask
+python orchestrator.py "<raw testing requirement>" --review-policy full-auto
 ```
 
-All artifacts are produced together so later LangChain/LangGraph nodes can consume stable files instead of scraping chat text. In Phase 2.6, DeepSeek handles requirement analysis and structured artifacts, the orchestrator performs deterministic local project context discovery before downstream generation, the review gate checks whether generated artifacts are safe to hand off, and `codex_task.md`/`codex_task.json` hand code implementation to Codex/GPT-5.5. The pipeline still does not modify project code or run tests by itself.
+The pipeline does not modify project code or run tests by itself. It generates planning and handoff artifacts. Codex still performs local project verification, CDP/F12 evidence discovery when needed, code-change planning, user confirmation, implementation, execution, repair, and final report.
 
-## Model Responsibility Split
+By default the pipeline writes a slim workbench:
 
-- DeepSeek v4-pro: requirement boosting, field extraction, test plan generation, structured test case generation, automation request generation, and execution request generation, constrained by discovered project context.
-- Orchestrator: deterministic local project context discovery before test plan generation.
-- Codex/GPT-5.5: project discovery verification, code-change planning, automated test implementation, test execution, failure repair, and final code-level report.
-- User confirmation gate: before Codex modifies code, selectors, page objects, or test flow, it must first list the files, intended changes, reasons, and validation commands, then wait for explicit user confirmation.
+```text
+index.html
+raw/raw_requirement.txt
+md/requirement.md
+md/test_plan.md
+md/test_cases.md
+md/report.md
+exports/test_cases.xlsx
+exports/test_cases.xmind
+json/automation_request.json
+json/test_cases.json
+json/execution_request.json
+```
 
-## Review Policy
+The local viewer shows only the human-readable files and exports. JSON files and `md/codex_task.md` are kept as background machine handoff artifacts for Codex and are not meant for routine manual review. Use `--full-artifacts` for audit/detail files and `--serve --port 8765` for a local clickable viewer. See `references/local-viewer.md` and `references/pipeline-artifacts.md`.
 
-Use `--review-policy` to choose how much the pipeline should pause before Codex handoff:
+### Workbench Mode
 
-| Policy | Behavior |
-|---|---|
-| `auto-review` | Default. Automatically reviews generated artifacts and blocks Codex handoff when high-risk items appear. |
-| `ask` | Always prompts in the command line before Codex handoff. Use this when a real project change is likely. |
-| `full-auto` | Writes review results but never blocks. Use only for quick drafts or low-risk exploration. |
+Use `scripts/workbench.py` when the user wants a browser-like local control panel instead of a one-shot command. The workbench can:
 
-The review gate checks for signals such as excessive test case scope, too many automation candidates, unknown target type, unconfirmed framework choice, and environment/data safety risks. If the gate blocks handoff, read `review_notes.md` before continuing.
+1. Accept a raw testing requirement and local materials such as images, xlsx/csv, txt, or md files.
+2. Run `orchestrator.py` and show the generated run folder.
+3. Preview `index.html` and prior runs.
+4. Call `codex.cmd exec` with `md/codex_task.md`, pass uploaded images with `--image`, and write logs under the run folder.
 
-## Recommended Companion Skills
+Run from any workspace:
 
-- `boost-prompt`: refine the user's rough request into a structured, high-quality testing prompt. For Inline mode. In Pipeline mode, the orchestrator script handles boosting via API.
-- `playwright-expert`: create or debug Playwright E2E tests, browser automation, visual checks, and page objects.
-- `test-fixing`: group failures, identify root causes, and repair broken tests.
-- `agent-browser`: explore a live web app, take screenshots, click through flows, or verify UI behavior.
-- `find-skills`: search for a more specific testing skill when the domain is outside the current workflow.
+```bash
+python path/to/workbench.py --project-root path/to/project --port 8765
+```
+
+The workbench still honors the same confirmation gates. By default Codex can be run in read-only mode for a proposal, and code edits require the user to explicitly allow them in the page.
 
 ## Workflow
 
-### 1. Intake And Prompt Refinement
+### 1. Intake And Requirement Refinement
 
-Convert the user's raw request into a structured testing brief.
+Clarify the target, business behavior, environment, data safety, deliverable, and success criteria. Use `references/test-requirement-template.md` when a structured Chinese requirement helps.
 
-**Pipeline mode**: Run the orchestrator script. It executes a Phase 2.6 pipeline (boost → review/edit boosted requirement → extract fields → discover project context → generate plan → generate cases → build automation request → build execution request → review gate → build Codex handoff → save report) via API and saves all artifacts as files.
-
-After boost, the script saves a review folder containing `raw_requirement.txt`, `boosted_requirement.md`, and `index.html`, then waits for confirmation:
-- Enter `yes`/`继续` to continue with the current boosted requirement.
-- Enter `edit`/`编辑` to edit `boosted_requirement.md`; save it, then return to the terminal and enter `yes`/`继续`.
-- Enter `no`/`取消` to stop before any downstream plan or test case generation.
-
-```bash
-cd <skill-dir>/scripts
-python orchestrator.py "用户的原始测试需求"
-python orchestrator.py "用户的原始测试需求" --review-policy ask
-python orchestrator.py "用户的原始测试需求" --review-policy full-auto
-```
-
-Use `--skip-boost` if the user already provides a well-structured requirement.
-
-Read `report.md`, `test_plan.md`, `test_cases.md`, and `codex_task.md` to present the result to the user.
-
-**Inline mode**: Refine the requirement directly. Ask up to three focused questions:
-- The test target: module, page, interface, feature, or user flow.
-- The system context: app URL, repo location, environment, credentials, test data safety.
-- The expected deliverable: plan only, test cases only, automation code, test execution, or full report.
-
-If the user wants quick progress, continue with explicit assumptions instead of waiting.
-
-Use `references/test-requirement-template.md` for the canonical Chinese requirement structure and output format.
-
-Inline refinement must visibly produce a short requirement-analysis artifact before any implementation plan. At minimum, include the refined requirement, assumptions, test scope, test points, and need-confirmation questions. If code is likely, include this before repository edits and before the user confirmation gate.
+Ask only blocking questions. If a detail can be safely inferred, continue and list it as an assumption.
 
 ### 2. Project Discovery
 
-Before writing test code, inspect the repository:
+Inspect the repository before implementation planning:
 
-- Look for framework signals: `package.json`, `playwright.config.*`, `cypress.config.*`, `pytest.ini`, `pyproject.toml`, `pom.xml`, `build.gradle`, existing `tests/`, `e2e/`, `specs/`, or CI files.
-- Read nearby existing tests and helper utilities before adding new patterns.
-- Identify how tests are run: `npm test`, `npm run test:e2e`, `npx playwright test`, `pytest`, Maven/Gradle, or repo-specific scripts.
-- Check whether dependencies are already installed. Ask before installing new dependencies unless the user has clearly requested setup.
+- Framework signals: `pytest.ini`, `playwright.config.*`, `cypress.config.*`, `pyproject.toml`, `package.json`, `pom.xml`, `build.gradle`.
+- Existing `tests/`, `e2e/`, `specs/`, `project/<module>/testcases/`, page objects, selectors, fixtures, helpers, and runners.
+- Existing test commands and report workflow.
+- Existing environment/config patterns for URL, account, team, credentials, and test data.
 
-Use `references/framework-guidance.md` to choose the implementation style.
+Use `references/framework-guidance.md`; for hybrid Pytest/Playwright/Electron projects, also use `references/hybrid-ui-automation-project-guide.md`.
 
-### 3. Test Plan And Case Design
+### 3. Test Plan And Cases
 
-Produce these sections before or alongside code:
+Produce:
 
-1. Test scope
-2. Test point breakdown
-3. Test case table with: case ID, title, preconditions, steps, test data, expected result, priority
-4. Need-confirmation questions
+- Test scope.
+- Test point breakdown.
+- Test case table with case ID, title, preconditions, steps, test data, expected result, and priority.
+- Need-confirmation questions.
+- Recommended first automation subset.
 
-Coverage must include, as applicable:
+Prefer a small P0/P1 set for the first implementation. Cover happy path, exception path, boundary values, permission control, data states, interface validation, security risks, and regression points when applicable.
 
-- Happy path
-- Exception path
-- Boundary values
-- Permission control
-- Data states
-- Interface validation
-- Security risks
-- Regression points
+### 4. CDP Element Evidence Gate
 
-When the user asks for automation, select a practical subset for the first implementation. Prefer P0/P1 cases and high-risk paths.
+Use `references/element-evidence-cdp.md` before writing or changing UI selectors, page objects, click/read/assert logic, or test flow.
 
-**Pipeline mode note**: When using the orchestrator script, the plan and cases are saved as both human-readable Markdown and machine-readable JSON. Read them to present results. Also read `project_context_discovery.md` / `project_context_discovery.json` to understand the project structure and hard constraints that shaped the generated artifacts. If the user wants code, treat `codex_task.md`, `codex_task.json`, `project_context_discovery.json`, and `project_context_request.json` as the handoff artifacts for Step 4 and still inspect the target project before writing files.
+Collect or request evidence for each UI element involved:
 
-### 4. Automation Implementation
+- Purpose in the test.
+- Minimal `outerHTML` or DOM fragment.
+- Stable attributes such as `id`, `name`, `value`, `class`, `role`, `aria-*`, `data-*`, `checked`, `selected`, `disabled`.
+- Visibility/clickability/readability state.
+- Before/after state changes for switches, radio buttons, dropdowns, tabs, popups, and custom widgets.
+- Chosen selector and why it is stable.
 
-Generate code only after understanding the target and project conventions.
+If evidence is unavailable, do not guess. Ask the user to provide F12/DevTools DOM or use an available CDP/browser tool to capture it.
 
-For Web UI and E2E:
+### 5. Automation Implementation
 
-- Prefer Playwright if available or if no framework exists and the user allows a choice.
-- Use stable locators: role, label, text, test IDs, and accessible names.
-- Avoid arbitrary waits. Prefer web-first assertions and event-based waits.
-- Keep tests independent. Use setup/teardown or fixtures for state.
-- Add page objects only when they match existing patterns or reduce repeated flow logic across multiple tests.
+Use `references/automation-code-rules.md` before editing code.
 
-For API:
+Implementation rules:
 
-- Prefer the repo's existing HTTP test style.
-- Validate status codes, response schema, business fields, error messages, auth behavior, idempotency, and boundary cases.
-- Keep secrets in environment variables.
+- Reuse existing page objects, selector classes, fixtures, base helpers, and runner patterns.
+- Keep test cases focused on flow and assertions; put reusable page details in page objects.
+- Add selectors to existing selector classes only when they are reusable; single-use selectors may stay in the test when the project allows it.
+- Use existing assertion helpers and report-step conventions.
+- Avoid body-text scanning, speculative fallback selectors, excessive waits, broad retries, and swallowed exceptions.
+- Let real product or selector failures surface.
 
-For unit or integration tests:
+### 6. Execution And Repair
 
-- Follow existing test runner, mocking style, fixtures, and naming.
-- Cover behavior, not implementation details.
+Run the narrowest relevant command first. If execution needs admin permissions, network, GUI/browser launch, or state-changing environment access, follow the workspace approval rules and explain impact.
 
-### 5. Execution And Repair
+When tests fail, classify the failure as test bug, product bug, environment issue, missing dependency, data issue, flaky timing, or unclear requirement. Fix only test bugs. Do not weaken assertions to hide product defects.
 
-After writing tests, run the narrowest relevant command first. If tests fail:
+### 7. Final Report
 
-- Classify failures: test bug, product bug, environment issue, missing dependency, flaky timing, bad data, or unclear requirement.
-- Repair test bugs directly.
-- Do not mask real product bugs by weakening assertions.
-- Re-run the targeted test command after changes.
-- Escalate only when dependency installation, network, browser launch, or protected filesystem access is required.
+Report:
 
-### 6. Final Report
+- Refined requirement and selected cases.
+- Element evidence status for UI work.
+- Files changed.
+- Commands run and results.
+- Remaining assumptions, risks, or user confirmations still needed.
 
-End with a concise report:
+If no code was written, say the output is a design/handoff artifact only.
 
-- What requirement was refined
-- What test plan/cases were produced
-- What files changed
-- What command was run and result
-- Remaining assumptions or questions
+## Inline To Pipeline Promotion
 
-If no code was written, clearly say the output is a test design artifact only.
+When the user confirms or edits an inline plan and later asks for saved artifacts, promote the latest inline draft into Pipeline Mode. Include:
 
-## Artifact Layout
+- Original raw requirement.
+- Latest refined requirement.
+- Confirmed and rejected assumptions.
+- Selected test scope and case table.
+- Element evidence plan or evidence summary.
+- Automation implementation notes.
+- Need-confirmation questions.
 
-When the user wants persistent artifacts or the task is complex, prefer the orchestrator output folder:
-
-```text
-output/
-  <feature>_<timestamp>/
-    raw_requirement.txt
-    boosted_requirement.md
-    fields.json
-    project_context_discovery.md
-    project_context_discovery.json
-    test_plan.md
-    test_cases.md
-    test_cases.json
-    automation_request.json
-    execution_request.json
-    review_result.json
-    review_notes.md
-    project_context_request.json
-    codex_task.json
-    codex_task.md
-    report.md
-```
-
-For actual automated test code, still follow the target repository's established directories. Do not create new test directories if the repo already has a better established location.
-
-## Quality Bar
-
-Use `references/evaluation-prompts.md` to evaluate or improve this skill. A good result should:
-
-- Preserve the user's actual business intent.
-- Make missing information visible without blocking unnecessarily.
-- Produce executable, maintainable tests when code is requested.
-- Run or clearly explain why tests were not run.
-- Avoid broad unrelated refactors.
+Do not restart from the original vague request if the conversation already refined it.
