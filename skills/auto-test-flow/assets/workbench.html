@@ -121,6 +121,10 @@
                     <label for="requirement">需求描述</label>
                     <textarea id="requirement" placeholder="请输入测试目标、业务规则、期望结果，或结合下方材料补充说明。"></textarea>
 
+                    <label for="targetUrl">目标页面 URL</label>
+                    <input id="targetUrl" type="text" placeholder="例如 https://example.com/login 或店铺内目标页面地址">
+                    <p class="meta">提供 URL 后，生成和 Codex 交接会优先围绕该页面采集 DOM 证据。</p>
+
                     <label for="attachments">需求材料</label>
                     <input id="attachments" type="file" multiple accept=".png,.jpg,.jpeg,.webp,.bmp,.xlsx,.xls,.csv,.txt,.md">
                     <p class="meta">支持图片、xlsx/xls、csv、txt、md。</p>
@@ -261,9 +265,13 @@
                       <option value="never">不请求确认，直接按权限执行</option>
                     </select>
                     <label for="executeExtraInstruction">启动前补充指令（非聊天）</label>
-                    <textarea id="executeExtraInstruction" class="compact-textarea" placeholder="这是一段随本次 Codex 执行一起发送的一次性要求，例如先输出修改计划、确认后再落地。"></textarea>
+                    <textarea id="executeExtraInstruction" class="compact-textarea" placeholder="例如同意采集 DOM、确认修改计划，或补充新的要求。"></textarea>
+                    <p class="meta">只读分析只产出方案；授权执行允许本轮在任务范围内连续修改和验证，遇到超范围、环境数据变更或缺少 DOM 证据时暂停。</p>
+                    <p id="continueHint" class="meta" style="color:var(--danger);display:none;">已有上轮 Codex 决策，请填写补充指令后点击 <strong>继续执行</strong>，不要重新开始。</p>
                     <div class="execute-action-row">
-                      <button id="executeCodexBtn" type="button">批准 Codex 执行</button>
+                      <button id="analysisCodexBtn" class="secondary" type="button">只读分析</button>
+                      <button id="authorizedCodexBtn" type="button">授权执行</button>
+                      <button id="continueCodexBtn" type="button">继续执行</button>
                       <button id="executeOpenReviewBtn" class="secondary small" type="button">查看审查</button>
                     </div>
                   </div>
@@ -298,6 +306,35 @@
                     </div>
                   </div>
                 </section>
+
+                <section class="panel execute-evidence-panel">
+                  <div class="panel-title">
+                    <div>
+                      <h2>页面证据采集</h2>
+                      <p class="panel-subtitle">输入 URL 或连接飞跨 CDP，生成 DOM 证据与候选 selector</p>
+                    </div>
+                  </div>
+                  <div class="execute-options">
+                    <label for="evidenceMode">采集方式</label>
+                    <select id="evidenceMode">
+                      <option value="url">打开 URL</option>
+                      <option value="electron_cdp">连接 Electron CDP 9333</option>
+                      <option value="store_cdp">连接店铺 CDP 9222</option>
+                    </select>
+                    <label for="evidenceUrl">页面 URL</label>
+                    <input id="evidenceUrl" type="text" placeholder="留空时 CDP 模式读取当前页面">
+                    <label for="evidenceSelectorFilter">范围过滤</label>
+                    <input id="evidenceSelectorFilter" type="text" placeholder="可选，例如 #app 或 .settings-panel">
+                    <div class="status evidence-job-status">
+                      <span id="evidenceStatusDot" class="dot"></span>
+                      <span id="evidenceStatusText">等待采集</span>
+                    </div>
+                    <div class="execute-action-row">
+                      <button id="captureEvidenceBtn" type="button">采集证据</button>
+                      <button id="openEvidenceBtn" class="secondary small" type="button">查看证据</button>
+                    </div>
+                  </div>
+                </section>
               </div>
 
               <section class="panel execute-result-panel">
@@ -309,6 +346,7 @@
                   <div class="execute-tabs" role="tablist" aria-label="执行结果">
                     <button class="result-tab active" data-execute-tab="summary" type="button">Codex 摘要</button>
                     <button class="result-tab" data-execute-tab="log" type="button">执行日志</button>
+                    <button class="result-tab" data-execute-tab="evidence" type="button">页面证据</button>
                     <button class="result-tab" data-execute-tab="allure" type="button">Allure 报告</button>
                   </div>
                 </div>
@@ -319,6 +357,10 @@
                   </div>
                   <div id="executeLogPanel" class="execute-tab-panel">
                     <pre id="executeLog" class="log-output visible-log"></pre>
+                  </div>
+                  <div id="executeEvidencePanel" class="execute-tab-panel">
+                    <div id="executeEvidenceEmpty" class="preview-empty">采集页面证据后在这里预览</div>
+                    <iframe id="executeEvidenceFrame" class="preview-frame" title="page evidence preview"></iframe>
                   </div>
                   <div id="executeAllurePanel" class="execute-tab-panel">
                     <iframe id="executeAllureFrame" class="preview-frame" title="Allure execution preview" src="/allure/allure_report/index.html"></iframe>

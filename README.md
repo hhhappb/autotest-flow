@@ -1,6 +1,6 @@
 # auto-test-flow
 
-Version: `v0.5`
+Version: `v0.6`
 
 [中文说明](README.zh-CN.md)
 
@@ -17,6 +17,14 @@ The current release focuses on a local workbench and safer UI automation handoff
 - Each run writes `index.html`, Markdown reports, Excel and XMind exports, JSON handoff files, and optional full audit artifacts.
 - Codex receives a compact handoff package that prioritizes generated `json/` and `md/` artifacts instead of reparsing raw spreadsheets.
 - The pipeline itself does not modify project code or run tests.
+
+### v0.6 Highlights
+
+- Adds workbench page-evidence capture from a direct URL or Feikua CDP, producing DOM evidence and candidate selector artifacts.
+- Adds clearer executable-step structure to `execution_request.json`.
+- Adds failure evidence diff reports to compare baseline evidence with current DOM after failed test runs.
+- Splits workbench evidence, Codex execution, and CDP preflight logic into focused modules for easier maintenance.
+- Documents the script dependency install path for `openpyxl`, `mistune`, FastAPI, and Uvicorn.
 
 ## What It Does
 
@@ -131,10 +139,10 @@ Restart Codex or Claude Code after installing or updating the skill so the new i
 
 The pipeline uses an Anthropic-compatible API. By default, it is configured for DeepSeek V4 Flash for faster requirement, plan, and test-case generation. Use V4 Pro only when you need higher-quality reasoning for unusually complex or ambiguous testing work.
 
-Install the Python client if it is not already available:
+Install the Python dependencies if they are not already available:
 
 ```powershell
-python -m pip install anthropic
+python -m pip install -r skills\auto-test-flow\scripts\requirements.txt
 ```
 
 ```powershell

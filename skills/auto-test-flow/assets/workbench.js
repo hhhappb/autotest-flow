@@ -3,6 +3,7 @@ let activeJobId = "";
 let activePreviewUrl = "";
 let activePreviewRun = null;
 let activeExecuteRun = null;
+let activeEvidenceUrl = "";
 let selectedFiles = [];
 
 const $ = (id) => document.getElementById(id);
@@ -78,13 +79,19 @@ async function saveSettings() {
 
 function setLog(lines) {
   const log = $("log");
-  const scrollTop = log.scrollTop;
+  const shouldFollowLog = log.scrollHeight <= log.clientHeight
+    || log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
   log.textContent = (lines || []).join("\n");
-  log.scrollTop = scrollTop;
+  if (shouldFollowLog) {
+    log.scrollTop = log.scrollHeight;
+  }
   const executeLog = $("executeLog");
-  const executeScrollTop = executeLog.scrollTop;
+  const shouldFollowExecuteLog = executeLog.scrollHeight <= executeLog.clientHeight
+    || executeLog.scrollTop + executeLog.clientHeight >= executeLog.scrollHeight - 8;
   executeLog.textContent = (lines || []).join("\n");
-  executeLog.scrollTop = executeScrollTop;
+  if (shouldFollowExecuteLog) {
+    executeLog.scrollTop = executeLog.scrollHeight;
+  }
 }
 
 function scrollLogToBottom() {
@@ -204,9 +211,17 @@ function setExecuteAllure(url) {
   showExecuteTab("allure");
 }
 
+function setExecuteEvidence(url) {
+  activeEvidenceUrl = url || "";
+  $("executeEvidenceFrame").src = activeEvidenceUrl;
+  $("executeEvidencePanel").classList.toggle("has-preview", Boolean(activeEvidenceUrl));
+  showExecuteTab("evidence");
+}
+
 function setExecuteRun(run) {
   activeRunDir = run.path;
   activeExecuteRun = run;
+  activeEvidenceUrl = run.evidence_diff_url || run.evidence_url || "";
   renderExecuteDetail();
   setExecutePreview(run.codex_summary_url || reviewUrl(run) || run.url || "");
   const label = reviewLabel(run);
@@ -268,6 +283,11 @@ function renderExecuteDetail() {
     : "等待执行";
 
   $("executeOpenReviewBtn").disabled = !reviewUrl(run);
+
+  const hasDecision = run.codex_status === "success" || run.codex_status === "unknown" || run.codex_status === "failed";
+  $("continueHint").style.display = hasDecision ? "" : "none";
+  $("continueCodexBtn").className = hasDecision ? "danger" : "";
+  $("authorizedCodexBtn").className = hasDecision ? "secondary" : "";
 }
 
 function openExecuteReview() {
@@ -279,6 +299,11 @@ function openExecuteSummary() {
   if (activeExecuteRun) {
     setExecutePreview(activeExecuteRun.codex_summary_url || reviewUrl(activeExecuteRun) || activeExecuteRun.url || "");
   }
+}
+
+function openExecuteEvidence() {
+  const url = activeEvidenceUrl || (activeExecuteRun && (activeExecuteRun.evidence_diff_url || activeExecuteRun.evidence_url));
+  if (url) setExecuteEvidence(url);
 }
 
 function toggleWorkSidebar(forceOpen) {
@@ -336,6 +361,12 @@ async function pollJob(jobId) {
         : "测试存在失败";
       if ($("viewExecute").classList.contains("active")) {
         setExecuteAllure(job.allure_report_url || "/allure/allure_report/index.html");
+      }
+    } else if (job.kind === "evidence") {
+      $("evidenceStatusDot").className = "dot " + (job.status === "success" ? "success" : "failed");
+      $("evidenceStatusText").textContent = job.status === "success" ? "证据采集完成" : "证据采集失败";
+      if (job.evidence_url) {
+        setExecuteEvidence(job.evidence_url);
       }
     } else if ($("viewExecute").classList.contains("active") && activeExecuteRun && activeExecuteRun.codex_summary_url) {
       setExecutePreview(activeExecuteRun.codex_summary_url);
@@ -416,6 +447,7 @@ async function generate() {
   const attachments = await collectAttachments();
   const data = await postJson("/api/generate", {
     requirement: $("requirement").value,
+    target_url: $("targetUrl").value,
     attachments,
     project_root: getProjectRoot(),
     output_dir: getOutputDir(),
@@ -440,12 +472,66 @@ async function runCodex(options = {}) {
   setFlowInputEnabled(false);
   const approvalPolicyId = options.approvalPolicyId || "executeApprovalPolicy";
   const extraInstructionId = options.extraInstructionId || "executeExtraInstruction";
+  const executionMode = options.executionMode || "analysis";
   const data = await postJson("/api/codex", {
     run_dir: activeRunDir,
     project_root: getProjectRoot(),
     output_dir: getOutputDir(),
     approval_policy: $(approvalPolicyId).value,
     extra_instruction: $(extraInstructionId).value,
+    execution_mode: executionMode,
+  });
+  pollJob(data.job.id).catch(showError);
+}
+
+async function continueCodex() {
+  if (!activeRunDir) {
+    setStatus("failed", "请先选择或生成一个产物目录");
+    showView("execute");
+    return;
+  }
+  showView("execute");
+  setStatus("running", "Codex 继续执行中");
+  setLog([]);
+  showExecuteTab("log");
+  activeJobId = "";
+  setFlowInputEnabled(false);
+  const data = await postJson("/api/codex", {
+    run_dir: activeRunDir,
+    project_root: getProjectRoot(),
+    output_dir: getOutputDir(),
+    approval_policy: $("executeApprovalPolicy").value,
+    extra_instruction: $("executeExtraInstruction").value,
+    execution_mode: "authorized",
+    continue_mode: true,
+  });
+  pollJob(data.job.id).catch(showError);
+}
+
+function evidenceCdpPort() {
+  const mode = $("evidenceMode").value;
+  if (mode === "store_cdp") return 9222;
+  if (mode === "electron_cdp") return 9333;
+  return 0;
+}
+
+async function captureEvidence() {
+  showView("execute");
+  setStatus("running", "页面证据采集中");
+  setLog([]);
+  showExecuteTab("log");
+  activeJobId = "";
+  setFlowInputEnabled(false);
+  $("evidenceStatusDot").className = "dot running";
+  $("evidenceStatusText").textContent = "采集中...";
+  const data = await postJson("/api/evidence", {
+    run_dir: activeRunDir,
+    mode: $("evidenceMode").value,
+    target_url: $("evidenceUrl").value || $("targetUrl").value,
+    selector_filter: $("evidenceSelectorFilter").value,
+    cdp_port: evidenceCdpPort(),
+    project_root: getProjectRoot(),
+    output_dir: getOutputDir(),
   });
   pollJob(data.job.id).catch(showError);
 }
@@ -465,8 +551,13 @@ async function runTest() {
   $("testStatusDot").className = "dot running";
   $("testStatusText").textContent = "执行中...";
   const data = await postJson("/api/run-tests", {
+    run_dir: activeRunDir,
     test_path: testPath,
     env: $("testEnv").value,
+    evidence_mode: $("evidenceMode").value,
+    evidence_target_url: $("evidenceUrl").value || $("targetUrl").value,
+    evidence_selector_filter: $("evidenceSelectorFilter").value,
+    evidence_cdp_port: evidenceCdpPort(),
     project_root: getProjectRoot(),
     output_dir: getOutputDir(),
   });
@@ -668,12 +759,22 @@ function renderDashboard(runs) {
 }
 
 $("generateBtn").addEventListener("click", () => generate().catch(showError));
-$("executeCodexBtn").addEventListener("click", () => runCodex({
+$("analysisCodexBtn").addEventListener("click", () => runCodex({
   view: "execute",
   approvalPolicyId: "executeApprovalPolicy",
   extraInstructionId: "executeExtraInstruction",
+  executionMode: "analysis",
 }).catch(showError));
+$("authorizedCodexBtn").addEventListener("click", () => runCodex({
+  view: "execute",
+  approvalPolicyId: "executeApprovalPolicy",
+  extraInstructionId: "executeExtraInstruction",
+  executionMode: "authorized",
+}).catch(showError));
+$("continueCodexBtn").addEventListener("click", () => continueCodex().catch(showError));
 $("runTestBtn").addEventListener("click", () => runTest().catch(showError));
+$("captureEvidenceBtn").addEventListener("click", () => captureEvidence().catch(showError));
+$("openEvidenceBtn").addEventListener("click", openExecuteEvidence);
 $("openAllureBtn").addEventListener("click", () => {
   setExecuteAllure("/allure/allure_report/index.html");
   showView("execute");

@@ -57,6 +57,8 @@ from templates.test_plan_prompt import (
     EXECUTION_REQUEST_JSON_SYSTEM_PROMPT,
     EXTRACT_FIELDS_SYSTEM_PROMPT,
     INTAKE_VALIDATION_SYSTEM_PROMPT,
+    JSON_SYSTEM_PREFIX,
+    SHARED_SYSTEM_PREFIX,
     TEST_CASES_JSON_SYSTEM_PROMPT,
     TEST_PLAN_SYSTEM_PROMPT,
 )
@@ -105,6 +107,14 @@ class TestWorkflowOrchestrator:
                 return block.text
         raise ValueError(f"No text block in response: {response.content}")
 
+    def _build_system_prompt(self, step_prompt: str, include_context: bool = False, json_output: bool = True) -> str:
+        """Build system prompt with shared prefix and optional project context."""
+        parts = [JSON_SYSTEM_PREFIX if json_output else SHARED_SYSTEM_PREFIX]
+        if include_context:
+            parts.append(self._project_context_prompt())
+        parts.append(step_prompt)
+        return "\n\n".join(parts)
+
     def _step_call_api(self, label: str, system_prompt: str, user_message: str,
                        temperature: float, max_tokens: int, result_key: str) -> dict:
         """Print header, call API, parse JSON, return dict -- used by steps 1/4/5/6."""
@@ -121,7 +131,7 @@ class TestWorkflowOrchestrator:
         print("=" * 60)
 
         validation_json = self._call_api(
-            system_prompt=INTAKE_VALIDATION_SYSTEM_PROMPT,
+            system_prompt=self._build_system_prompt(INTAKE_VALIDATION_SYSTEM_PROMPT),
             user_message=raw_requirement,
             temperature=0,
             max_tokens=2048,
@@ -158,7 +168,7 @@ class TestWorkflowOrchestrator:
     def step_extract_fields(self) -> dict:
         self.fields = self._step_call_api(
             "Step 1/9 提取结构化字段",
-            EXTRACT_FIELDS_SYSTEM_PROMPT,
+            self._build_system_prompt(EXTRACT_FIELDS_SYSTEM_PROMPT),
             f"请从以下测试需求中提取字段：\n\n{self.requirement_text}",
             0.2, 2048, "fields")
         print(json.dumps(self.fields, ensure_ascii=False, indent=2))
@@ -196,7 +206,7 @@ class TestWorkflowOrchestrator:
 
         user_prompt = self._build_test_plan_user_prompt(self.fields)
         self.test_plan = self._call_api(
-            system_prompt=TEST_PLAN_SYSTEM_PROMPT,
+            system_prompt=self._build_system_prompt(TEST_PLAN_SYSTEM_PROMPT, include_context=True, json_output=False),
             user_message=user_prompt,
             temperature=PLAN_TEMPERATURE,
             max_tokens=PLAN_MAX_TOKENS,
@@ -208,7 +218,7 @@ class TestWorkflowOrchestrator:
     def step_generate_test_cases(self) -> dict:
         self.test_cases = self._step_call_api(
             "Step 4/9 生成结构化测试用例",
-            TEST_CASES_JSON_SYSTEM_PROMPT,
+            self._build_system_prompt(TEST_CASES_JSON_SYSTEM_PROMPT, include_context=True),
             self._build_test_cases_user_prompt(),
             PLAN_TEMPERATURE, PLAN_MAX_TOKENS, "test_cases")
         print(f"生成用例数量: {len(self.test_cases.get('cases', []))}")
@@ -218,7 +228,7 @@ class TestWorkflowOrchestrator:
     def step_build_automation_request(self) -> dict:
         self.automation_request = self._step_call_api(
             "Step 5/9 生成自动化脚本实现请求",
-            AUTOMATION_REQUEST_JSON_SYSTEM_PROMPT,
+            self._build_system_prompt(AUTOMATION_REQUEST_JSON_SYSTEM_PROMPT, include_context=True),
             self._build_automation_request_prompt(),
             0.2, 4096, "automation_request")
         print(json.dumps(self.automation_request, ensure_ascii=False, indent=2)[:800])
@@ -228,7 +238,7 @@ class TestWorkflowOrchestrator:
     def step_build_execution_request(self) -> dict:
         self.execution_request = self._step_call_api(
             "Step 6/9 生成执行请求",
-            EXECUTION_REQUEST_JSON_SYSTEM_PROMPT,
+            self._build_system_prompt(EXECUTION_REQUEST_JSON_SYSTEM_PROMPT, include_context=True),
             self._build_execution_request_prompt(),
             0.2, 4096, "execution_request")
         print(json.dumps(self.execution_request, ensure_ascii=False, indent=2)[:800])
@@ -351,6 +361,11 @@ class TestWorkflowOrchestrator:
         name = re.sub(r"[^\u4e00-\u9fff\w]", "_", name)
         return name[:max_len].strip("_") or "test_plan"
 
+    @staticmethod
+    def _extract_target_url(text: str) -> str:
+        match = re.search(r"https?://[^\s`，。；；)）>]+", text or "")
+        return match.group(0).rstrip(".,;") if match else ""
+
     def _project_context_prompt(self) -> str:
         if not self.project_context_discovery:
             return "Project context discovery has not run. Do not invent project files or commands."
@@ -412,9 +427,6 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
         """Build a project-aware user prompt for test plan generation."""
         return f"""请根据以下信息生成测试方案：
 
-【项目上下文发现（必须遵守）】
-{self._project_context_prompt()}
-
 【测试对象】{self._fmt(fields.get('test_object'))}
 
 【业务背景】{self._fmt(fields.get('business_context'))}
@@ -438,10 +450,7 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 
     def _build_test_cases_user_prompt(self) -> str:
         """Build a project-aware user prompt for structured test cases."""
-        return f"""请基于以下结构化字段、项目上下文发现和测试方案生成结构化测试用例 JSON。
-
-【项目上下文发现（必须遵守）】
-{self._project_context_prompt()}
+        return f"""请基于以下结构化字段和测试方案生成结构化测试用例 JSON。
 
 【结构化字段】
 {self._json_block(self.fields)}
@@ -462,9 +471,6 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
         """Build a project-aware automation handoff prompt."""
         return f"""请基于以下信息生成自动化脚本实现请求 JSON。注意：只生成请求，不输出代码。
 
-【项目上下文发现（必须遵守）】
-{self._project_context_prompt()}
-
 【结构化字段】
 {self._json_block(self.fields)}
 
@@ -481,10 +487,11 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 
     def _build_execution_request_prompt(self) -> str:
         """Build a project-aware execution handoff prompt."""
+        target_url = self._extract_target_url(self.requirement_text)
         return f"""请基于以下信息生成测试执行请求 JSON。注意：只生成执行计划，不真正执行测试。
 
-【项目上下文发现（必须遵守）】
-{self._project_context_prompt()}
+【目标页面 URL（如有）】
+{target_url or "未提供"}
 
 【结构化字段】
 {self._json_block(self.fields)}
@@ -567,10 +574,12 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
         selected_cases = self.automation_request.get("selected_cases", [])
         if isinstance(selected_cases, str):
             selected_cases = [selected_cases]
+        target_url = self._extract_target_url(self.requirement_text)
 
         return {
             "phase": "Phase 2.6 Codex handoff",
             "status": "ready_for_codex_review",
+            "target_url": target_url,
             "owner_split": {
                 "deepseek": [
                     "intake 校验",
@@ -599,6 +608,9 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
                 "test_cases_json": "json/test_cases.json",
                 "automation_request": "json/automation_request.json",
                 "execution_request": "json/execution_request.json",
+                "evidence_markdown": "md/evidence.md (created by workbench evidence capture when available)",
+                "evidence_json": "json/evidence.json (created by workbench evidence capture when available)",
+                "evidence_diff": "md/evidence_diff.md (created after failed test runs when available)",
                 "report": "md/report.md",
                 "full_artifacts": "full/ (only when --full-artifacts is used)",
             },
@@ -684,6 +696,7 @@ Codex handoff was skipped by the review gate.
         owner = self.codex_task.get("owner_split", {})
         deepseek_items = "\n".join(f"- {item}" for item in owner.get("deepseek", []))
         codex_items = "\n".join(f"- {item}" for item in owner.get("codex_gpt_55", []))
+        target_url = self.codex_task.get("target_url") or "未提供"
 
         return f"""# Codex Handoff Task
 
@@ -702,8 +715,15 @@ Codex handoff was skipped by the review gate.
 - `json/test_cases.json`
 - `json/automation_request.json`
 - `json/execution_request.json`
+- `md/evidence.md`（如果工作台已采集页面证据）
+- `json/evidence.json`（如果工作台已采集页面证据）
+- `md/evidence_diff.md`（如果测试失败后已生成差异报告）
 - `json/input_materials.json`
 - `raw/raw_requirement.txt`
+
+## 目标页面 URL
+
+{target_url}
 
 ## DeepSeek 与 Codex 职责边界
 
@@ -719,6 +739,8 @@ Codex handoff was skipped by the review gate.
 - 测试用例：读取 `json/test_cases.json` 和 `md/test_cases.md`。
 - 自动化实现请求：读取 `json/automation_request.json`。
 - 执行请求：读取 `json/execution_request.json`。
+- 页面证据：如果存在 `md/evidence.md` 或 `json/evidence.json`，先读取它们，再决定 selector/page object/testcase 修改方案。
+- 失败差异：如果存在 `md/evidence_diff.md`，只把它作为候选诊断依据，不要自动猜改代码。
 - 审查结论：读取 `md/review_notes.md` 和 `json/review_result.json`。
 - 原始需求：只在结构化产物缺失或互相冲突时，再读取 `raw/raw_requirement.txt`。
 

@@ -58,6 +58,12 @@ python orchestrator.py "<raw testing requirement>" --review-policy ask
 python orchestrator.py "<raw testing requirement>" --review-policy full-auto
 ```
 
+Install script dependencies first when running outside an environment that already provides them:
+
+```bash
+python -m pip install -r scripts/requirements.txt
+```
+
 The pipeline does not modify project code or run tests by itself. It generates planning and handoff artifacts. Codex still performs local project verification, CDP/F12 evidence discovery when needed, code-change planning, user confirmation, implementation, execution, repair, and final report.
 
 By default the pipeline writes a slim workbench:

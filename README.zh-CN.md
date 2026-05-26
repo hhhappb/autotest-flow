@@ -1,6 +1,6 @@
 # auto-test-flow
 
-版本：`v0.5`
+版本：`v0.6`
 
 [English README](README.md)
 
@@ -17,6 +17,14 @@
 - 每次运行会生成 `index.html`、Markdown 报告、Excel/XMind 导出、JSON 交接文件，以及可选的 full 审计产物。
 - Codex 接收精简后的 handoff 任务包，优先读取已生成的 `json/` 和 `md/` 产物，不再默认反复解析原始表格。
 - pipeline 本身不会修改项目代码，也不会真实执行测试。
+
+### v0.6 重点更新
+
+- 工作台新增页面证据采集入口，支持直接输入 URL 或连接飞跨 CDP，生成 DOM 证据和候选 selector 产物。
+- `execution_request.json` 增加更清晰的可执行步骤结构。
+- 测试失败后可生成证据差异报告，对比 baseline evidence 和失败后的当前 DOM。
+- 将 workbench 的页面证据、Codex 执行、CDP 预检逻辑拆成独立模块，方便后续维护。
+- 补充脚本依赖安装说明，覆盖 `openpyxl`、`mistune`、FastAPI 和 Uvicorn。
 
 ## 能力概览
 
@@ -134,7 +142,7 @@ pipeline 使用 Anthropic-compatible API。默认配置面向 DeepSeek V4 Flash�
 如果本地还没有 Python client，请先安装：
 
 ```powershell
-python -m pip install anthropic
+python -m pip install -r skills\auto-test-flow\scripts\requirements.txt
 ```
 
 ```powershell

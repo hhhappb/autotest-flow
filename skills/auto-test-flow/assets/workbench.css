@@ -1442,6 +1442,7 @@ button.danger-lite:hover {
 .execute-current-panel,
 .execute-control-panel,
 .execute-test-panel,
+.execute-evidence-panel,
 .execute-result-panel {
   overflow: hidden;
 }
@@ -1522,7 +1523,8 @@ button.danger-lite:hover {
 }
 
 .execute-job-status,
-.test-job-status {
+.test-job-status,
+.evidence-job-status {
   margin-top: 14px;
   padding: 10px 12px;
   background: #f8fafc;
@@ -1643,6 +1645,14 @@ button.danger-lite:hover {
 }
 
 #executeSummaryPanel.has-preview .preview-empty {
+  display: none;
+}
+
+#executeEvidencePanel:not(.has-preview) .preview-frame {
+  display: none;
+}
+
+#executeEvidencePanel.has-preview .preview-empty {
   display: none;
 }
 

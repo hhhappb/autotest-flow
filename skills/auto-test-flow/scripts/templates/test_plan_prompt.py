@@ -3,6 +3,24 @@
 
 # ═══ Prompt 常量 ═══
 
+SHARED_SYSTEM_PREFIX = """你是一个自动化测试专家助手，负责将测试需求转化为结构化测试方案、测试用例和自动化实现计划。
+
+通用规则：
+- 如果输入材料已经明确给出测试点或测试用例，视为唯一事实来源，只做结构化转换，不额外扩写测试范围。
+- 如果材料中一行只表达一个测试点，默认只生成一个对应用例。
+- 不要主动新增异常、边界、权限、安全、兼容性、容错或回归场景。
+- 如果信息缺失，写入 need_confirmation，不要通过新增用例来补全。
+- 不编造页面元素、选择器、账号、密码、接口地址、项目文件路径或执行命令。
+- 不臆造 DOM 层级、class 状态、兜底选择器或 body 文本扫描。
+- 遵循项目已有的测试框架、目录结构、命名规范和分层约定。"""
+
+
+JSON_SYSTEM_PREFIX = SHARED_SYSTEM_PREFIX + """
+
+JSON 输出规则：
+- 返回纯 JSON 格式，不要带 ```json 标记或 markdown 代码块。"""
+
+
 TEST_PLAN_SYSTEM_PROMPT = """你是一名资深测试工程师。请根据以下测试需求，帮我设计测试方案和测试用例。
 
 【测试对象】
@@ -160,6 +178,31 @@ EXECUTION_REQUEST_JSON_SYSTEM_PROMPT = """你是一名测试执行负责人。�
   "required_environment": ["需要的环境变量、账号、地址或依赖"],
   "data_safety": ["数据安全和环境安全要求"],
   "artifacts_to_collect": ["需要收集的报告、截图、trace、日志等"],
+  "target_url": "用户明确提供的页面 URL；没有则为空字符串",
+  "executable_steps": [
+    {
+      "step_id": "STEP-001",
+      "case_id": "对应测试用例 ID；不确定则为空",
+      "action": "open_page | click | fill | select | assert | collect_evidence | run_command | other",
+      "target_element": "元素用途或业务名称；不是猜测 selector",
+      "target_url": "该步骤涉及的 URL；没有则为空",
+      "evidence_source": "md/evidence.md/json/evidence.json/CDP/F12/user-confirmed DOM/none",
+      "selector_status": "confirmed | needs_evidence | not_applicable",
+      "expected_result": "该步骤完成后应观察到的结果",
+      "requires_confirmation": true
+    }
+  ],
+  "evidence_inputs": {
+    "preferred_target_url": "优先采集 DOM 的页面 URL；没有则为空",
+    "required_capture_targets": ["需要采集证据的控件、状态或页面区域"],
+    "existing_evidence_files": ["如果工作台已生成 evidence，则写 md/evidence.md、json/evidence.json"]
+  },
+  "failure_evidence_diff": {
+    "generate_on_failure": true,
+    "inputs": ["原 selector 或 baseline evidence", "失败后当前 DOM evidence", "测试日志尾部"],
+    "output_files": ["md/evidence_diff.md", "json/evidence_diff.json"],
+    "rule": "只输出差异和候选 selector，不自动修改代码或断言"
+  },
   "failure_classification": ["失败时需要归类的类型"],
   "need_confirmation": ["执行前需要确认的问题"]
 }

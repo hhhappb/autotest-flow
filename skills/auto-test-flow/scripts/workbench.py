@@ -1,10 +1,10 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Local web workbench for auto-test-flow.
 
-The workbench is intentionally dependency-free. It serves a small local web UI,
-runs the existing orchestrator, and can hand a generated codex_task.md to
-`codex.cmd exec` while keeping logs beside the generated run artifacts.
+The workbench serves a local web UI, runs the existing orchestrator,
+and can hand a generated codex_task.md to `codex.cmd exec` while
+keeping logs beside the generated run artifacts.
 """
 
 from __future__ import annotations
@@ -15,34 +15,48 @@ import csv
 import html
 import io
 import json
-import mimetypes
 import os
-import posixpath
 import re
 import shutil
 import subprocess
 import sys
 import threading
-import time
 import uuid
 import webbrowser
-import zipfile
 from datetime import datetime
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote, unquote, urlparse
-from xml.etree import ElementTree
+from urllib.parse import quote, unquote
+
+import openpyxl
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+
+from workbench_cdp import (
+    DEFAULT_ELECTRON_DEBUG_PORT,
+    DEFAULT_STORE_DEBUG_PORT,
+    prepare_authorized_cdp_environment,
+    resolve_test_project_root,
+)
+from workbench_codex import start_codex_execution_job
+from workbench_evidence import (
+    EVIDENCE_MODES,
+    maybe_write_failure_evidence_diff,
+    start_evidence_job as start_evidence_capture_job,
+)
 
 
 FINAL_STATUSES = {"success", "failed"}
 REVIEW_POLICIES = {"auto-review", "full-auto"}
 APPROVAL_POLICIES = {"on-request", "never"}
+EXECUTION_MODES = {"analysis", "authorized"}
 DEEPSEEK_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 TEXT_EXTENSIONS = {".txt", ".md", ".csv"}
 SPREADSHEET_EXTENSIONS = {".xlsx", ".xls"}
 SUPPORTED_ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS | TEXT_EXTENSIONS | SPREADSHEET_EXTENSIONS
+MAX_JOB_LOG_LINES = 3000
 
 
 class WorkbenchState:
@@ -99,7 +113,7 @@ class WorkbenchState:
         with self.lock:
             job = self.jobs[job_id]
             job["logs"].append(line)
-            job["logs"] = job["logs"][-3000:]
+            job["logs"] = job["logs"][-MAX_JOB_LOG_LINES:]
             job["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
     def update_job(self, job_id: str, **fields) -> None:
@@ -111,7 +125,31 @@ class WorkbenchState:
     def get_job(self, job_id: str) -> dict | None:
         with self.lock:
             job = self.jobs.get(job_id)
-            return json.loads(json.dumps(job, ensure_ascii=False)) if job else None
+            snapshot = json.loads(json.dumps(job, ensure_ascii=False)) if job else None
+        if not snapshot:
+            return None
+
+        file_logs = self._read_log_file_tail(snapshot.get("log_file"))
+        if file_logs:
+            if snapshot.get("status") != "running":
+                memory_logs = snapshot.get("logs") or []
+                for line in memory_logs:
+                    if line not in file_logs:
+                        file_logs.append(line)
+            snapshot["logs"] = file_logs[-MAX_JOB_LOG_LINES:]
+        return snapshot
+
+    @staticmethod
+    def _read_log_file_tail(log_file: str | None) -> list[str]:
+        if not log_file:
+            return []
+        path = Path(log_file)
+        if not path.exists() or not path.is_file():
+            return []
+        try:
+            return path.read_text(encoding="utf-8", errors="replace").splitlines()[-MAX_JOB_LOG_LINES:]
+        except OSError:
+            return []
 
     def attach_process(self, job_id: str, process: subprocess.Popen) -> None:
         with self.lock:
@@ -158,6 +196,8 @@ class WorkbenchState:
                     "codex_summary_url": codex.get("summary_url"),
                     "codex_log_url": codex.get("log_url"),
                     "codex_last_message_url": codex.get("last_message_url"),
+                    "evidence_url": self._run_file_url(path, "md/evidence.md"),
+                    "evidence_diff_url": self._run_file_url(path, "md/evidence_diff.md"),
                 }
             )
         return runs[:50]
@@ -193,6 +233,12 @@ class WorkbenchState:
                     "counts": {},
                 }
         return {}
+
+    @staticmethod
+    def _run_file_url(run_dir: Path, relative_path: str) -> str | None:
+        if not (run_dir / relative_path).exists():
+            return None
+        return f"/runs/{quote(run_dir.name)}/{relative_path}"
 
     @staticmethod
     def _read_codex_status(run_dir: Path) -> dict:
@@ -376,7 +422,7 @@ def _looks_more_readable(candidate: str, original: str) -> bool:
     original_hits = sum(word in original for word in common_words)
     if candidate_hits > original_hits:
         return True
-    cjk = re.compile(r"[\u4e00-\u9fff]")
+    cjk = re.compile(r"[一-鿿]")
     candidate_score = len(cjk.findall(candidate)) - candidate.count("�")
     original_score = len(cjk.findall(original)) - original.count("�")
     return candidate_score >= original_score
@@ -398,6 +444,7 @@ def prepare_input_materials(
     requirement: str,
     attachments: list[dict],
     project_root: Path,
+    target_url: str = "",
 ) -> tuple[str, list[dict]]:
     """Save uploaded materials and build text that orchestrator can consume."""
     materials_dir = state.output_dir / "_workbench_uploads" / job_id
@@ -433,7 +480,7 @@ def prepare_input_materials(
         }
         materials.append(material)
 
-    combined_requirement = _build_combined_requirement(requirement, materials, project_root)
+    combined_requirement = _build_combined_requirement(requirement, materials, project_root, target_url)
     return combined_requirement, materials
 
 
@@ -480,73 +527,38 @@ def _extract_csv_text(path: Path) -> str:
 
 def _extract_xlsx_text(path: Path) -> str:
     try:
-        with zipfile.ZipFile(path) as archive:
-            shared_strings = _read_xlsx_shared_strings(archive)
-            sheet_names = sorted(
-                name for name in archive.namelist()
-                if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
-            )
-            lines = []
-            for sheet_index, sheet_name in enumerate(sheet_names[:8], start=1):
-                lines.append(f"[Sheet {sheet_index}: {sheet_name}]")
-                xml_content = archive.read(sheet_name)
-                lines.extend(_read_xlsx_sheet_rows(xml_content, shared_strings))
-                lines.append("")
-            if len(sheet_names) > 8:
-                lines.append("... xlsx sheet 数量较多，仅展示前 8 个。")
-            return _truncate("\n".join(lines).strip(), 16000)
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        lines = []
+        sheet_names = wb.sheetnames
+        for sheet_index, sheet_name in enumerate(sheet_names[:8], start=1):
+            lines.append(f"[Sheet {sheet_index}: {sheet_name}]")
+            sheet = wb[sheet_name]
+            for row_index, row in enumerate(sheet.iter_rows(max_row=80, values_only=True), start=1):
+                cells = [str(cell).strip() if cell is not None else "" for cell in row[:30]]
+                if any(cells):
+                    lines.append(" | ".join(cells))
+            lines.append("")
+        if len(sheet_names) > 8:
+            lines.append("... xlsx sheet 数量较多，仅展示前 8 个。")
+        wb.close()
+        return _truncate("\n".join(lines).strip(), 16000)
     except Exception as exc:  # noqa: BLE001 - keep pipeline usable with a note.
         return f"xlsx 内容抽取失败，文件仍已保存，可由 Codex/人工查看。错误：{exc}"
-
-
-def _read_xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
-    try:
-        root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
-    except KeyError:
-        return []
-    namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    strings = []
-    for item in root.findall("x:si", namespace):
-        parts = [node.text or "" for node in item.findall(".//x:t", namespace)]
-        strings.append("".join(parts))
-    return strings
-
-
-def _read_xlsx_sheet_rows(xml_content: bytes, shared_strings: list[str]) -> list[str]:
-    namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    root = ElementTree.fromstring(xml_content)
-    rows = []
-    for row_index, row in enumerate(root.findall(".//x:sheetData/x:row", namespace), start=1):
-        if row_index > 80:
-            rows.append("... sheet 内容已截断，仅展示前 80 行。")
-            break
-        cells = []
-        for cell in row.findall("x:c", namespace)[:30]:
-            cells.append(_read_xlsx_cell(cell, shared_strings, namespace).strip())
-        if any(cells):
-            rows.append(" | ".join(cells))
-    return rows
-
-
-def _read_xlsx_cell(cell: ElementTree.Element, shared_strings: list[str], namespace: dict[str, str]) -> str:
-    cell_type = cell.attrib.get("t")
-    value = cell.find("x:v", namespace)
-    if cell_type == "s" and value is not None:
-        try:
-            return shared_strings[int(value.text or "0")]
-        except (ValueError, IndexError):
-            return value.text or ""
-    if cell_type == "inlineStr":
-        return "".join(node.text or "" for node in cell.findall(".//x:t", namespace))
-    return value.text if value is not None and value.text is not None else ""
 
 
 def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "\n... 内容已截断。"
 
 
-def _build_combined_requirement(requirement: str, materials: list[dict], project_root: Path) -> str:
+def _build_combined_requirement(
+    requirement: str,
+    materials: list[dict],
+    project_root: Path,
+    target_url: str = "",
+) -> str:
     parts = ["【项目根目录】\n" + str(project_root)]
+    if target_url.strip():
+        parts.append("【目标页面 URL】\n" + target_url.strip())
     if requirement.strip():
         parts.append("【需求描述】\n" + requirement.strip())
     if materials:
@@ -638,21 +650,6 @@ def normalize_codex_workspace_root(candidate: Path) -> Path:
         if (parent / "AGENTS.md").exists():
             return parent
     return candidate
-
-
-def resolve_test_project_root(workspace_root: Path) -> Path:
-    """Resolve the runnable auto-test project root without changing the Codex workspace root."""
-    root = workspace_root.expanduser().resolve()
-    candidates = [root]
-    if root.name.lower() != "auto-test":
-        candidates.append(root / "auto-test")
-    checked = []
-    for candidate in candidates:
-        candidate = candidate.resolve()
-        checked.append(str(candidate / "runner.py"))
-        if (candidate / "runner.py").exists():
-            return candidate
-    raise ValueError("未找到 auto-test runner.py，已检查: " + "；".join(checked))
 
 
 def normalize_test_path(test_project_root: Path, value: str) -> str:
@@ -756,8 +753,9 @@ def select_file(initial_dir: str = "", title: str = "选择文件") -> str:
 def start_generation_job(state: WorkbenchState, payload: dict) -> dict:
     requirement = str(payload.get("requirement", "")).strip()
     attachments = payload.get("attachments") or []
-    if not requirement and not attachments:
-        raise ValueError("requirement or attachment is required")
+    target_url = str(payload.get("target_url", "")).strip()
+    if not requirement and not attachments and not target_url:
+        raise ValueError("requirement, target_url, or attachment is required")
     apply_settings(state, payload)
     project_root = resolve_project_root(state, payload.get("project_root"))
 
@@ -774,6 +772,7 @@ def start_generation_job(state: WorkbenchState, payload: dict) -> dict:
         requirement,
         attachments,
         project_root,
+        target_url,
     )
     thread = threading.Thread(
         target=_run_generation_job,
@@ -864,102 +863,23 @@ def start_codex_job(state: WorkbenchState, payload: dict) -> dict:
     approval_policy = str(payload.get("approval_policy", "on-request"))
     if approval_policy not in APPROVAL_POLICIES:
         raise ValueError(f"approval_policy must be one of {sorted(APPROVAL_POLICIES)}")
+    execution_mode = str(payload.get("execution_mode", "analysis"))
+    if execution_mode not in EXECUTION_MODES:
+        raise ValueError(f"execution_mode must be one of {sorted(EXECUTION_MODES)}")
 
-    run_dir = state.resolve_run_dir(run_ref)
-    project_root = resolve_project_root(state, payload.get("project_root"))
-    extra_instruction = str(payload.get("extra_instruction", "")).strip()
-    job = state.create_job("codex")
-    job_id = job["id"]
-    thread = threading.Thread(
-        target=_run_codex_job,
-        args=(state, job_id, run_dir, project_root, approval_policy, extra_instruction),
-        daemon=True,
+    return start_codex_execution_job(
+        state=state,
+        run_dir=state.resolve_run_dir(run_ref),
+        project_root=resolve_project_root(state, payload.get("project_root")),
+        approval_policy=approval_policy,
+        extra_instruction=str(payload.get("extra_instruction", "")).strip(),
+        continue_mode=bool(payload.get("continue_mode")),
+        execution_mode=execution_mode,
+        load_input_materials_func=load_input_materials,
+        run_command_func=run_command,
+        repair_mojibake_func=_repair_mojibake,
+        prepare_authorized_cdp_environment_func=prepare_authorized_cdp_environment,
     )
-    thread.start()
-    return job
-
-
-def _run_codex_job(
-    state: WorkbenchState,
-    job_id: str,
-    run_dir: Path,
-    project_root: Path,
-    approval_policy: str,
-    extra_instruction: str,
-) -> None:
-    logs_dir = run_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / f"codex_exec_{job_id}.log"
-    last_message_path = logs_dir / f"codex_last_message_{job_id}.md"
-    sandbox = "workspace-write"
-    codex_task_path = run_dir / "md" / "codex_task.md"
-    if not codex_task_path.exists():
-        state.update_job(job_id, status="failed", error=f"Missing {codex_task_path}")
-        return
-    materials = load_input_materials(run_dir)
-
-    prompt = build_codex_prompt(
-        run_dir=run_dir,
-        project_root=project_root,
-        codex_task_path=codex_task_path,
-        materials=materials,
-        extra_instruction=extra_instruction,
-    )
-    prompt_path = logs_dir / f"codex_prompt_{job_id}.md"
-    prompt_path.write_text(prompt, encoding="utf-8")
-
-    command = [
-        state.codex_command,
-        "exec",
-        "-C",
-        str(project_root),
-        "--skip-git-repo-check",
-        "--sandbox",
-        sandbox,
-        "-c",
-        f"approval_policy={json.dumps(approval_policy)}",
-        "--output-last-message",
-        str(last_message_path),
-    ]
-    for material in materials:
-        if material.get("kind") == "image":
-            image_path = Path(material.get("path", ""))
-            if image_path.exists():
-                command.extend(["--image", str(image_path)])
-    command.append("-")
-
-    try:
-        state.update_job(
-            job_id,
-            run_dir=str(run_dir),
-            run_url=f"/runs/{quote(run_dir.name)}/index.html",
-            last_message_file=str(last_message_path),
-        )
-        state.append_log(job_id, "Codex 已启动，前台只显示最终决策摘要。")
-        state.append_log(job_id, f"工作目录: {project_root}")
-        state.append_log(job_id, f"执行模式: 任务范围内可修改，审批策略 {approval_policy}")
-        state.append_log(job_id, f"完整原始日志: {log_path}")
-        exit_code = run_command(
-            state,
-            job_id,
-            command,
-            project_root,
-            log_path,
-            input_text=prompt,
-            stream_output_to_job=True,
-        )
-        status = "success" if exit_code == 0 else "failed"
-        summary_path = _write_codex_decision_summary(run_dir, job_id, last_message_path, exit_code)
-        state.append_log(job_id, "")
-        state.append_log(job_id, "Codex 决策摘要")
-        for line in summary_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            state.append_log(job_id, line)
-        state.append_log(job_id, "")
-        state.append_log(job_id, f"Exit code: {exit_code}")
-        state.update_job(job_id, status=status, exit_code=exit_code, summary_file=str(summary_path))
-    except Exception as exc:  # noqa: BLE001 - show exact local failure.
-        state.append_log(job_id, f"ERROR: {exc}")
-        state.update_job(job_id, status="failed", error=str(exc))
 
 
 def start_test_job(state: WorkbenchState, payload: dict) -> dict:
@@ -971,11 +891,32 @@ def start_test_job(state: WorkbenchState, payload: dict) -> dict:
         raise ValueError("env must be test, production, or all")
     apply_settings(state, payload)
     project_root = resolve_project_root(state, payload.get("project_root"))
+    run_ref = str(payload.get("run_dir", "")).strip()
+    run_dir = state.resolve_run_dir(run_ref) if run_ref else None
+    evidence_mode = str(payload.get("evidence_mode", "url")).strip() or "url"
+    if evidence_mode not in EVIDENCE_MODES:
+        raise ValueError(f"evidence_mode must be one of {sorted(EVIDENCE_MODES)}")
+    evidence_target_url = str(payload.get("evidence_target_url", "")).strip()
+    evidence_selector_filter = str(payload.get("evidence_selector_filter", "")).strip() or None
+    evidence_cdp_port = int(payload.get("evidence_cdp_port") or (
+        DEFAULT_STORE_DEBUG_PORT if evidence_mode == "store_cdp" else DEFAULT_ELECTRON_DEBUG_PORT
+    ))
     job = state.create_job("test")
     job_id = job["id"]
     thread = threading.Thread(
         target=_run_test_job,
-        args=(state, job_id, project_root, test_path, env),
+        args=(
+            state,
+            job_id,
+            project_root,
+            test_path,
+            env,
+            run_dir,
+            evidence_mode,
+            evidence_target_url,
+            evidence_selector_filter,
+            evidence_cdp_port,
+        ),
         daemon=True,
     )
     thread.start()
@@ -988,6 +929,11 @@ def _run_test_job(
     project_root: Path,
     test_path: str,
     env: str,
+    run_dir: Path | None = None,
+    evidence_mode: str = "url",
+    evidence_target_url: str = "",
+    evidence_selector_filter: str | None = None,
+    evidence_cdp_port: int = DEFAULT_ELECTRON_DEBUG_PORT,
 ) -> None:
     log_path = state.output_dir / "_workbench_logs" / f"test_{job_id}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1029,187 +975,22 @@ def _run_test_job(
         else:
             state.append_log(job_id, f"测试{'全部通过' if passed else '存在失败，请查看 Allure 报告'}")
         state.append_log(job_id, f"Exit code: {exit_code}")
+        if not passed:
+            maybe_write_failure_evidence_diff(
+                state=state,
+                job_id=job_id,
+                run_dir=run_dir,
+                test_path=normalized_test_path,
+                log_path=log_path,
+                target_url=evidence_target_url,
+                mode=evidence_mode,
+                selector_filter=evidence_selector_filter,
+                cdp_port=evidence_cdp_port,
+                browser_channel=config.browser if "config" in globals() else "chrome",
+            )
     except Exception as exc:  # noqa: BLE001 - show exact local failure.
         state.append_log(job_id, f"ERROR: {exc}")
         state.update_job(job_id, status="failed", error=str(exc))
-
-
-def _write_codex_decision_summary(run_dir: Path, job_id: str, last_message_path: Path, exit_code: int) -> Path:
-    logs_dir = run_dir / "logs"
-    summary_path = logs_dir / f"codex_decision_{job_id}.md"
-    if last_message_path.exists():
-        text = _repair_mojibake(last_message_path.read_text(encoding="utf-8", errors="replace")).strip()
-    else:
-        text = ""
-    if not text:
-        text = "Codex 没有写出最终消息。请查看完整原始日志定位原因。"
-    lines = [
-        f"退出码: {exit_code}",
-        f"最终消息: {last_message_path}",
-        "",
-        _compact_final_message(text),
-    ]
-    summary_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
-    return summary_path
-
-
-def _compact_final_message(text: str, max_lines: int = 120) -> str:
-    lines = [line.rstrip() for line in text.splitlines()]
-    compact = []
-    skip_markers = (
-        "succeeded in ",
-        "tokens used",
-        "session id:",
-        "OpenAI Codex",
-        "--------",
-    )
-    for line in lines:
-        stripped = line.strip()
-        if any(stripped.startswith(marker) for marker in skip_markers):
-            continue
-        compact.append(line)
-        if len(compact) >= max_lines:
-            compact.append("... 决策摘要已截断；完整内容见 codex_last_message 文件。")
-            break
-    return "\n".join(compact).strip()
-
-
-def build_codex_prompt(
-    run_dir: Path,
-    project_root: Path,
-    codex_task_path: Path,
-    materials: list[dict],
-    extra_instruction: str,
-) -> str:
-    codex_task = _compact_codex_task_for_prompt(codex_task_path.read_text(encoding="utf-8", errors="replace"))
-    edit_mode = (
-        "用户已经在本地工作台批准 Codex 执行。你可以在本次交接任务范围内进行最小必要修改和验证；"
-        "修改代码前仍必须遵守 AGENTS.md 和本提示中的确认规则。"
-        "如果发现目标文件、选择器、测试数据、环境影响或验证命令超出交接任务，必须停止并说明需要新的确认。"
-    )
-    extra = f"\n\n用户补充指令：\n{extra_instruction}\n" if extra_instruction else ""
-    materials_text = _build_codex_materials_text(materials)
-    return f"""你现在由 auto-test-flow 本地工作台调用。
-
-项目根目录：
-{project_root}
-
-交接产物目录：
-{run_dir}
-
-输入材料：
-{materials_text}
-
-执行模式：
-{edit_mode}
-
-必须遵循：
-- 读取并遵守项目 AGENTS.md。若当前目录未看到 `AGENTS.md`，先检查当前目录父级；本地工作台会优先把 Codex 工作目录提升到包含 `AGENTS.md` 的工作区根目录。
-- 优先调用或遵循 `karpathy-12-rules` skill；如果当前环境无法加载该 skill，则按其核心纪律执行：先读代码、少改、不要猜、不要过度设计、暴露假设、定义验证闭环。
-- 接管阶段优先读取已生成的结构化产物：`json/test_cases.json`、`json/automation_request.json`、`json/execution_request.json`、`json/input_materials.json`、`md/test_cases.md`、`md/test_plan.md` 和当前 `md/codex_task.md`。这些产物已经承载原始材料解析结果。
-- 不要默认回头解析原始 `.xlsx/.xls` 附件；只有结构化产物明显缺失、互相冲突，或用户明确要求核对原始附件时，才说明原因并请求读取原始附件。
-- 如果读取或解析 `.xlsx/.xls` 的命令被 sandbox/policy 拒绝，必须停止这条路径，改读结构化产物；不要反复更换 Python、tar、PowerShell、压缩包解析等命令继续尝试。
-- UI 选择器、页面对象、点击、读取、断言、流程修改前，必须有 CDP/F12/真实 DOM 证据；没有证据时不要猜选择器或加兜底逻辑。
-- 如果缺少 DOM 证据，必须先在项目和本 skill 中查找并优先复用现有 CDP/元素证据采集能力，例如 `auto-test/core/utils/electron_cdp.py`、`auto-test/core/base/base_electron_page.py`、`auto-test/conftest.py` 的 CDP fixture，以及 `autotest-flow/skills/auto-test-flow/scripts/element_evidence.py`。只有确认本地没有可用采集路径，才请求用户提供 F12 DOM。
-- 需要 DOM 证据时，不要要求用户手工抄 DOM；应先输出“证据采集计划”，说明准备打开的页面、会读取的元素、是否会登录、是否会保存配置、建议命令和环境影响，并等待用户授权。
-- 用户授权采集后，优先用 CDP/Playwright 读取真实 DOM、outerHTML、checked/value/class/selected/disabled 等状态变化，再基于证据提出 selector/page object/testcase 修改计划。
-- 修改必须保持最小可验证范围，不能为了通过测试削弱断言或隐藏产品问题。
-- 如需执行管理员权限、网络、GUI、会修改店铺配置或测试环境数据的命令，先说明影响并等待用户确认。
-- 分析范围优先限定在交接产物、AGENTS.md、相关测试用例、page object、selector 和最窄必要的公共辅助代码；如果扩大范围，必须说明原因。
-- 结束时只输出给用户做决策的摘要，不要复述代码库扫描过程、完整命令输出或中间推理。
-- 最终消息必须包含：结论、是否需要用户确认、准备修改/已修改文件、修改原因、已执行/未执行命令、剩余风险。
-{extra}
-下面是由 `md/codex_task.md` 压缩生成的精简交接摘要；如摘要不足，再按路径读取完整产物：
-
-```markdown
-{codex_task}
-```
-"""
-
-
-def _compact_codex_task_for_prompt(text: str) -> str:
-    target = _extract_markdown_section(text, "任务目标")
-    required = _extract_markdown_section(text, "必读产物")
-    summary = _extract_markdown_section(text, "当前测试设计摘要")
-    summary = _strip_fenced_blocks(summary)
-
-    lines = [
-        "# Codex Handoff Task（精简版）",
-        "",
-        "完整交接文件仍保存在 `md/codex_task.md`；当前 prompt 只保留执行所需的最小摘要，避免重复规则和大段 JSON 增加处理时间。",
-        "",
-        "## 任务目标",
-        "",
-        _compact_text(target, 1200) or "基于 Phase 2 产物接管自动化测试代码落地，读取结构化产物后输出修改计划、等待确认，并在允许后进行最小必要实现和验证。",
-        "",
-        "## 必读结构化产物",
-        "",
-        "- `md/codex_task.md`：完整交接说明，只有摘要不足时再读取。",
-        "- `md/test_plan.md`：测试方案可读版。",
-        "- `md/test_cases.md`：测试用例可读版。",
-        "- `json/test_cases.json`：结构化测试用例。",
-        "- `json/automation_request.json`：自动化实现请求、目标文件和风险。",
-        "- `json/execution_request.json`：运行命令、环境要求和失败分类。",
-        "- `json/input_materials.json`：原始材料摘要和附件路径。",
-        "- `raw/raw_requirement.txt`：原始需求文本。",
-        "",
-    ]
-    if required:
-        lines.extend([
-            "## 原交接文件列出的必读产物",
-            "",
-            _compact_text(required, 900),
-            "",
-        ])
-    if summary:
-        lines.extend([
-            "## 当前测试设计摘要（已移除内嵌 JSON，按需读取 json/ 文件）",
-            "",
-            _compact_text(summary, 1600),
-            "",
-        ])
-    lines.extend([
-        "## 执行重点",
-        "",
-        "- 优先读取上面的 `json/` 与 `md/` 结构化产物，不要默认重新解析原始 `.xlsx/.xls`。",
-        "- 如果结构化产物缺失或互相冲突，先说明缺口，再请求是否读取原始附件。",
-        "- 不要重复展开 Karpathy、修改确认、CDP/F12 Gate；这些规则已经由工作台模板和 AGENTS.md 注入。",
-    ])
-    return "\n".join(line.rstrip() for line in lines).strip()
-
-
-def _extract_markdown_section(text: str, title: str) -> str:
-    pattern = re.compile(rf"^##\s+{re.escape(title)}\s*$", re.MULTILINE)
-    match = pattern.search(text)
-    if not match:
-        return ""
-    next_heading = re.search(r"^##\s+", text[match.end():], re.MULTILINE)
-    end = match.end() + next_heading.start() if next_heading else len(text)
-    return text[match.end():end].strip()
-
-
-def _strip_fenced_blocks(text: str) -> str:
-    return re.sub(r"```[\s\S]*?```", "（内嵌代码块/JSON 已省略；请读取对应 json/ 文件。）", text).strip()
-
-
-def _compact_text(text: str, max_chars: int) -> str:
-    compact = re.sub(r"\n{3,}", "\n\n", text.strip())
-    if len(compact) <= max_chars:
-        return compact
-    return compact[:max_chars].rstrip() + "\n...（已截断；完整内容见 `md/codex_task.md` 或对应结构化产物。）"
-
-
-def _build_codex_materials_text(materials: list[dict]) -> str:
-    if not materials:
-        return "无附件材料。"
-    lines = []
-    for material in materials:
-        lines.append(
-            f"- {material.get('name')} ({material.get('kind')}, {material.get('size')} bytes): {material.get('path')}"
-        )
-    lines.append("")
-    lines.append("默认不要重新解析原始附件；优先读取 json/input_materials.json 和其他结构化产物。只有结构化产物缺失、冲突或用户明确要求时，才请求读取原始附件。")
-    return "\n".join(lines)
 
 
 def _existing_run_dirs(output_dir: Path) -> set[Path]:
@@ -1231,209 +1012,176 @@ def _find_new_run_dir(output_dir: Path, before: set[Path]) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
 
 
-class WorkbenchHandler(BaseHTTPRequestHandler):
-    server: "WorkbenchHTTPServer"
+# ---------------------------------------------------------------------------
+# FastAPI application
+# ---------------------------------------------------------------------------
 
-    def do_GET(self) -> None:  # noqa: N802 - stdlib API name.
-        parsed = urlparse(self.path)
-        try:
-            if parsed.path == "/":
-                self._send_html(build_index_html(self.server.state))
-                return
-            if parsed.path.startswith("/assets/"):
-                self._serve_asset_file(parsed.path)
-                return
-            if parsed.path == "/api/runs":
-                self._send_json({"runs": self.server.state.list_runs()})
-                return
-            if parsed.path.startswith("/api/jobs/"):
-                job_id = parsed.path.rsplit("/", 1)[-1]
-                job = self.server.state.get_job(job_id)
-                if not job:
-                    self._send_json({"error": "job not found"}, HTTPStatus.NOT_FOUND)
-                    return
-                self._send_json({"job": job})
-                return
-            if parsed.path.startswith("/runs/"):
-                self._serve_run_file(parsed.path)
-                return
-            if parsed.path.startswith("/allure/"):
-                self._serve_allure_file(parsed.path)
-                return
-            self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-        except Exception as exc:  # noqa: BLE001 - local diagnostic API.
-            self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
-
-    def do_POST(self) -> None:  # noqa: N802 - stdlib API name.
-        try:
-            payload = self._read_json()
-            if self.path == "/api/generate":
-                job = start_generation_job(self.server.state, payload)
-                self._send_json({"job": job})
-                return
-            if self.path == "/api/codex":
-                job = start_codex_job(self.server.state, payload)
-                self._send_json({"job": job})
-                return
-            if self.path == "/api/run-tests":
-                job = start_test_job(self.server.state, payload)
-                self._send_json({"job": job})
-                return
-            if self.path == "/api/settings":
-                settings = apply_settings(self.server.state, payload)
-                self._send_json(settings)
-                return
-            if self.path == "/api/select-directory":
-                selected = select_directory(
-                    str(payload.get("initial_dir", "")).strip(),
-                    str(payload.get("title", "选择目录")).strip(),
-                )
-                self._send_json({"path": selected})
-                return
-            if self.path == "/api/select-file":
-                selected = select_file(
-                    str(payload.get("initial_dir", "")).strip(),
-                    str(payload.get("title", "选择文件")).strip(),
-                )
-                self._send_json({"path": selected})
-                return
-            if self.path == "/api/runs/delete":
-                run_ref = str(payload.get("run_dir") or payload.get("path") or payload.get("name") or "").strip()
-                if not run_ref:
-                    raise ValueError("run_dir is required")
-                self.server.state.delete_run(run_ref)
-                self._send_json({"ok": True})
-                return
-            if self.path.startswith("/api/jobs/") and self.path.endswith("/input"):
-                job_id = self.path.split("/")[-2]
-                text = str(payload.get("input", ""))
-                if not text.strip():
-                    raise ValueError("input is required")
-                job = self.server.state.send_input(job_id, text)
-                self._send_json({"job": job})
-                return
-            self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-        except Exception as exc:  # noqa: BLE001 - return useful workbench error.
-            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-
-    def log_message(self, format: str, *args) -> None:  # noqa: A002 - stdlib signature.
-        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), format % args))
-
-    def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length)
-        return json.loads(raw.decode("utf-8"))
-
-    def _serve_asset_file(self, request_path: str) -> None:
-        rel = request_path[len("/assets/") :]
-        rel = posixpath.normpath(unquote(rel)).lstrip("/")
-        if not rel or rel.startswith("../"):
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-
-        target = (_asset_dir() / rel).resolve()
-        asset_root = _asset_dir().resolve()
-        if asset_root not in target.parents and target != asset_root:
-            self.send_error(HTTPStatus.FORBIDDEN)
-            return
-        if not target.exists() or not target.is_file():
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-
-        mime_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-        data = target.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", f"{mime_type}; charset=utf-8" if _is_text_mime(mime_type) else mime_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _serve_run_file(self, request_path: str) -> None:
-        rel = request_path[len("/runs/") :]
-        rel = posixpath.normpath(unquote(rel)).lstrip("/")
-        if not rel or rel.startswith("../"):
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-
-        parts = rel.split("/")
-        run_name = parts[0]
-        subpath = Path(*parts[1:]) if len(parts) > 1 else Path("index.html")
-        run_dir = self.server.state.resolve_run_dir(run_name)
-        target = (run_dir / subpath).resolve()
-        if run_dir.resolve() not in target.parents and target != run_dir.resolve():
-            self.send_error(HTTPStatus.FORBIDDEN)
-            return
-        if not target.exists() or not target.is_file():
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-
-        mime_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-        data = target.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", f"{mime_type}; charset=utf-8" if _is_text_mime(mime_type) else mime_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _serve_allure_file(self, request_path: str) -> None:
-        rel = request_path[len("/allure/") :]
-        rel = posixpath.normpath(unquote(rel)).lstrip("/")
-        if not rel or rel.startswith("../"):
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        try:
-            test_project_root = resolve_test_project_root(self.server.state.project_root)
-        except ValueError as exc:
-            self.send_error(HTTPStatus.NOT_FOUND, str(exc))
-            return
-        report_root = (test_project_root / "testreport").resolve()
-        target = (report_root / rel).resolve()
-        if report_root not in target.parents and target != report_root:
-            self.send_error(HTTPStatus.FORBIDDEN)
-            return
-        if not target.exists() or not target.is_file():
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        mime_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-        data = target.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", f"{mime_type}; charset=utf-8" if _is_text_mime(mime_type) else mime_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
-        data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _send_html(self, content: str) -> None:
-        data = content.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+app = FastAPI(title="自动化测试平台")
 
 
-class WorkbenchHTTPServer(ThreadingHTTPServer):
-    def __init__(self, server_address, handler_class, state: WorkbenchState):
-        super().__init__(server_address, handler_class)
-        self.state = state
+def _get_state(request: Request) -> WorkbenchState:
+    return request.app.state.workbench
 
 
-def _is_text_mime(mime_type: str) -> bool:
-    return mime_type.startswith("text/") or mime_type in {
-        "application/json",
-        "application/javascript",
-        "application/xml",
-    }
+# ---------------------------------------------------------------------------
+# API routes
+# ---------------------------------------------------------------------------
 
+@app.get("/api/runs")
+async def api_list_runs(request: Request):
+    return {"runs": _get_state(request).list_runs()}
+
+
+@app.get("/api/jobs/{job_id}")
+async def api_get_job(job_id: str, request: Request):
+    job = _get_state(request).get_job(job_id)
+    if not job:
+        return JSONResponse({"error": "job not found"}, status_code=404)
+    return {"job": job}
+
+
+@app.post("/api/generate")
+async def api_generate(request: Request):
+    payload = await request.json()
+    job = start_generation_job(_get_state(request), payload)
+    return {"job": job}
+
+
+@app.post("/api/codex")
+async def api_codex(request: Request):
+    payload = await request.json()
+    job = start_codex_job(_get_state(request), payload)
+    return {"job": job}
+
+
+@app.post("/api/run-tests")
+async def api_run_tests(request: Request):
+    payload = await request.json()
+    job = start_test_job(_get_state(request), payload)
+    return {"job": job}
+
+
+@app.post("/api/evidence")
+async def api_evidence(request: Request):
+    payload = await request.json()
+    job = start_evidence_capture_job(_get_state(request), payload, apply_settings)
+    return {"job": job}
+
+
+@app.post("/api/settings")
+async def api_settings(request: Request):
+    payload = await request.json()
+    settings = apply_settings(_get_state(request), payload)
+    return settings
+
+
+@app.post("/api/select-directory")
+async def api_select_directory(request: Request):
+    payload = await request.json()
+    selected = select_directory(
+        str(payload.get("initial_dir", "")).strip(),
+        str(payload.get("title", "选择目录")).strip(),
+    )
+    return {"path": selected}
+
+
+@app.post("/api/select-file")
+async def api_select_file(request: Request):
+    payload = await request.json()
+    selected = select_file(
+        str(payload.get("initial_dir", "")).strip(),
+        str(payload.get("title", "选择文件")).strip(),
+    )
+    return {"path": selected}
+
+
+@app.post("/api/runs/delete")
+async def api_delete_run(request: Request):
+    payload = await request.json()
+    run_ref = str(payload.get("run_dir") or payload.get("path") or payload.get("name") or "").strip()
+    if not run_ref:
+        raise ValueError("run_dir is required")
+    _get_state(request).delete_run(run_ref)
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/input")
+async def api_job_input(job_id: str, request: Request):
+    payload = await request.json()
+    text = str(payload.get("input", ""))
+    if not text.strip():
+        raise ValueError("input is required")
+    job = _get_state(request).send_input(job_id, text)
+    return {"job": job}
+
+
+# ---------------------------------------------------------------------------
+# Static file routes
+# ---------------------------------------------------------------------------
+
+async def _serve_run_file(state: WorkbenchState, run_name: str, file_path: str) -> Response:
+    run_dir = state.resolve_run_dir(unquote(run_name))
+    target = (run_dir / unquote(file_path)).resolve()
+    if run_dir.resolve() not in target.parents and target != run_dir.resolve():
+        return Response(status_code=403)
+    if not target.exists() or not target.is_file():
+        return Response(status_code=404)
+    return FileResponse(target)
+
+
+@app.get("/")
+async def index(request: Request):
+    return HTMLResponse(build_index_html(_get_state(request)))
+
+
+@app.get("/runs/{run_name}")
+async def serve_run_root(run_name: str, request: Request):
+    return await _serve_run_file(_get_state(request), run_name, "index.html")
+
+
+@app.get("/runs/{run_name}/{file_path:path}")
+async def serve_run_path(run_name: str, file_path: str, request: Request):
+    return await _serve_run_file(_get_state(request), run_name, file_path)
+
+
+@app.get("/allure/{file_path:path}")
+async def serve_allure_path(file_path: str, request: Request):
+    state = _get_state(request)
+    try:
+        test_root = resolve_test_project_root(state.project_root)
+    except ValueError:
+        return Response(status_code=404)
+    report_root = (test_root / "testreport").resolve()
+    target = (report_root / unquote(file_path)).resolve()
+    if report_root not in target.parents and target != report_root:
+        return Response(status_code=403)
+    if not target.exists() or not target.is_file():
+        return Response(status_code=404)
+    return FileResponse(target)
+
+
+# ---------------------------------------------------------------------------
+# Exception handlers
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(ValueError)
+async def _value_error_handler(request: Request, exc: ValueError):
+    return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.exception_handler(FileNotFoundError)
+async def _file_not_found_handler(request: Request, exc: FileNotFoundError):
+    return JSONResponse({"error": str(exc)}, status_code=404)
+
+
+@app.exception_handler(Exception)
+async def _general_error_handler(request: Request, exc: Exception):
+    return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _asset_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "assets"
@@ -1487,7 +1235,12 @@ def main() -> None:
         codex_command=args.codex_command,
         model=os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash"),
     )
-    server = WorkbenchHTTPServer((state.host, state.port), WorkbenchHandler, state)
+    app.state.workbench = state
+
+    assets_dir = _asset_dir()
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
     url = f"http://{state.host}:{state.port}/"
     print(f"自动化测试平台: {url}")
     print(f"Project root: {state.project_root}")
@@ -1495,12 +1248,7 @@ def main() -> None:
     print("Press Ctrl+C to stop.")
     if args.open_browser:
         webbrowser.open(url)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopping workbench.")
-    finally:
-        server.server_close()
+    uvicorn.run(app, host=state.host, port=state.port, log_level="warning")
 
 
 if __name__ == "__main__":

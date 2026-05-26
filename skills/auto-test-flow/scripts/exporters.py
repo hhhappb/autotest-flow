@@ -1,64 +1,34 @@
 #!/usr/bin/env python3
 """Export generated test cases to spreadsheet and mind-map formats."""
 
-import html
 import json
 import zipfile
 from pathlib import Path
 
+import openpyxl
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+
 
 def write_test_cases_xlsx(path: Path, test_cases: dict) -> None:
-    """Write test cases as a dependency-free Excel workbook."""
+    """Write test cases as an Excel workbook using openpyxl."""
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = _test_case_export_rows(test_cases)
-    sheet_data = []
-    for row_index, row in enumerate(rows, start=1):
-        cells = []
-        for col_index, value in enumerate(row, start=1):
-            cell_ref = f"{_xlsx_col_name(col_index)}{row_index}"
-            text = _xml_text(value)
-            cells.append(
-                f'<c r="{cell_ref}" t="inlineStr"><is><t>{text}</t></is></c>'
-            )
-        sheet_data.append(f'<row r="{row_index}">{"".join(cells)}</row>')
 
-    worksheet = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <cols>
-<col min="1" max="1" width="16" customWidth="1"/>
-<col min="2" max="2" width="28" customWidth="1"/>
-<col min="3" max="5" width="14" customWidth="1"/>
-<col min="6" max="9" width="36" customWidth="1"/>
-  </cols>
-  <sheetData>
-{''.join(sheet_data)}
-  </sheetData>
-</worksheet>"""
-    workbook = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <sheets><sheet name="测试用例" sheetId="1" r:id="rId1"/></sheets>
-</workbook>"""
-    rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-</Relationships>"""
-    workbook_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-</Relationships>"""
-    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-</Types>"""
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", content_types)
-        archive.writestr("_rels/.rels", rels)
-        archive.writestr("xl/workbook.xml", workbook)
-        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
-        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "测试用例"
+    ws.append(rows[0])
+    ws.row_dimensions[1].font = Font(bold=True)
+    for row in rows[1:]:
+        ws.append(row)
+
+    column_widths = [16, 28, 14, 14, 14, 36, 36, 36, 36]
+    for col_index, width in enumerate(column_widths, start=1):
+        ws.column_dimensions[get_column_letter(col_index)].width = width
+
+    wb.save(path)
+
 
 def write_test_cases_xmind(path: Path, test_cases: dict) -> None:
     """Write test cases as a simple XMind 2020 compatible workbook."""
@@ -112,6 +82,7 @@ def write_test_cases_xmind(path: Path, test_cases: dict) -> None:
         archive.writestr("metadata.json", json.dumps(metadata, ensure_ascii=False, indent=2))
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
+
 def _test_case_export_rows(test_cases: dict) -> list[list[str]]:
     rows = [[
         "用例编号",
@@ -138,6 +109,7 @@ def _test_case_export_rows(test_cases: dict) -> list[list[str]]:
         ])
     return rows
 
+
 def _plain_text(value) -> str:
     if value is None:
         return ""
@@ -146,13 +118,3 @@ def _plain_text(value) -> str:
     if isinstance(value, dict):
         return "\n".join(f"{key}: {val}" for key, val in value.items())
     return str(value)
-
-def _xlsx_col_name(index: int) -> str:
-    name = ""
-    while index:
-        index, remainder = divmod(index - 1, 26)
-        name = chr(65 + remainder) + name
-    return name
-
-def _xml_text(value) -> str:
-    return html.escape(str(value), quote=False)

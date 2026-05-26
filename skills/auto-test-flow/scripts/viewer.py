@@ -5,6 +5,14 @@ import html
 import re
 from pathlib import Path
 
+try:
+    import mistune
+except ImportError:  # pragma: no cover - reported clearly when rendering.
+    mistune = None
+
+
+_MARKDOWN_RENDERER = None
+
 
 def build_html_viewer(run_dir: Path) -> str:
     """Build an offline HTML viewer for generated Markdown and JSON artifacts."""
@@ -236,124 +244,80 @@ blockquote {{
 </html>
 """
 
+
 def render_markdown_fragment(text: str) -> str:
+    if mistune is not None:
+        return _get_markdown_renderer()(text)
+    return _render_markdown_fallback(text)
+
+
+def _section_id(filename: str) -> str:
+    return "doc-" + re.sub(r"[^a-zA-Z0-9]+", "-", filename).strip("-").lower()
+
+
+def _get_markdown_renderer():
+    global _MARKDOWN_RENDERER
+    if _MARKDOWN_RENDERER is not None:
+        return _MARKDOWN_RENDERER
+    if mistune is None:
+        raise RuntimeError("缺少 mistune 依赖，请先安装 scripts/requirements.txt。")
+    try:
+        _MARKDOWN_RENDERER = mistune.create_markdown(escape=True, plugins=["table"])
+    except Exception:  # noqa: BLE001 - keep older/newer mistune variants usable.
+        _MARKDOWN_RENDERER = mistune.create_markdown(escape=True)
+    return _MARKDOWN_RENDERER
+
+
+def _render_markdown_fallback(text: str) -> str:
     lines = text.splitlines()
     html_parts = []
     paragraph = []
-    list_stack = []
     in_code = False
     code_lines = []
-    i = 0
 
     def flush_paragraph():
         if paragraph:
-            html_parts.append(f"<p>{render_inline(' '.join(paragraph))}</p>")
+            html_parts.append(f"<p>{_render_inline(' '.join(paragraph))}</p>")
             paragraph.clear()
 
-    def close_lists():
-        while list_stack:
-            html_parts.append(f"</{list_stack.pop()}>")
-
-    while i < len(lines):
-        line = lines[i]
+    for line in lines:
         stripped = line.strip()
-
         if stripped.startswith("```"):
             flush_paragraph()
-            close_lists()
             if in_code:
                 html_parts.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
                 code_lines = []
                 in_code = False
             else:
                 in_code = True
-            i += 1
             continue
-
         if in_code:
             code_lines.append(line)
-            i += 1
             continue
-
         if not stripped:
             flush_paragraph()
-            close_lists()
-            i += 1
             continue
-
-        if stripped.startswith("|") and i + 1 < len(lines) and _is_markdown_table_separator(lines[i + 1]):
-            flush_paragraph()
-            close_lists()
-            table_lines = [stripped, lines[i + 1].strip()]
-            i += 2
-            while i < len(lines) and lines[i].strip().startswith("|"):
-                table_lines.append(lines[i].strip())
-                i += 1
-            html_parts.append(_render_table(table_lines))
-            continue
-
         heading = re.match(r"^(#{1,4})\s+(.+)$", stripped)
         if heading:
             flush_paragraph()
-            close_lists()
             level = len(heading.group(1))
-            html_parts.append(f"<h{level}>{render_inline(heading.group(2))}</h{level}>")
-            i += 1
+            html_parts.append(f"<h{level}>{_render_inline(heading.group(2))}</h{level}>")
             continue
-
-        if stripped.startswith(">"):
+        item = re.match(r"^[-*]\s+(.+)$", stripped)
+        if item:
             flush_paragraph()
-            close_lists()
-            html_parts.append(f"<blockquote>{render_inline(stripped.lstrip('> ').strip())}</blockquote>")
-            i += 1
+            html_parts.append(f"<ul><li>{_render_inline(item.group(1))}</li></ul>")
             continue
-
-        unordered = re.match(r"^[-*]\s+(.+)$", stripped)
-        ordered = re.match(r"^\d+\.\s+(.+)$", stripped)
-        if unordered or ordered:
-            flush_paragraph()
-            tag = "ul" if unordered else "ol"
-            if not list_stack or list_stack[-1] != tag:
-                close_lists()
-                list_stack.append(tag)
-                html_parts.append(f"<{tag}>")
-            item = unordered.group(1) if unordered else ordered.group(1)
-            html_parts.append(f"<li>{render_inline(item)}</li>")
-            i += 1
-            continue
-
-        close_lists()
         paragraph.append(stripped)
-        i += 1
 
     flush_paragraph()
-    close_lists()
     if in_code:
         html_parts.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
     return "\n".join(html_parts)
 
-def _is_markdown_table_separator(line: str) -> bool:
-    return bool(re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", line))
 
-def _render_table(lines: list[str]) -> str:
-    header = _split_table_row(lines[0])
-    body_rows = [_split_table_row(line) for line in lines[2:]]
-    header_html = "".join(f"<th>{render_inline(cell)}</th>" for cell in header)
-    body_html = []
-    for row in body_rows:
-        cells = row + [""] * max(0, len(header) - len(row))
-        body_html.append("<tr>" + "".join(f"<td>{render_inline(cell)}</td>" for cell in cells[:len(header)]) + "</tr>")
-    return f"<table><thead><tr>{header_html}</tr></thead><tbody>{''.join(body_html)}</tbody></table>"
-
-def _split_table_row(line: str) -> list[str]:
-    return [cell.strip() for cell in line.strip().strip("|").split("|")]
-
-def _section_id(filename: str) -> str:
-    return "doc-" + re.sub(r"[^a-zA-Z0-9]+", "-", filename).strip("-").lower()
-
-def render_inline(text: str) -> str:
+def _render_inline(text: str) -> str:
     escaped = html.escape(text)
     escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
-    escaped = escaped.replace("&lt;br&gt;", "<br>").replace("&lt;br/&gt;", "<br>").replace("&lt;br /&gt;", "<br>")
-    return escaped
+    return escaped.replace("&lt;br&gt;", "<br>").replace("&lt;br/&gt;", "<br>").replace("&lt;br /&gt;", "<br>")
