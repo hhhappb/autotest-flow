@@ -233,6 +233,153 @@ body {
   animation: viewIn 0.3s ease forwards;
 }
 
+#viewReports.active {
+  display: flex;
+  height: calc(100vh - 116px);
+  min-height: 0;
+}
+
+#viewReports .panel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.reports-panel {
+  min-height: 0;
+}
+
+.reports-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+  gap: 16px;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 16px 22px 22px;
+}
+
+.report-list-panel,
+.report-preview-panel {
+  min-height: 0;
+}
+
+.report-list-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: #f8fafc;
+}
+
+.report-list-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.report-list-title span {
+  color: var(--muted);
+}
+
+.allure-report-list {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  min-height: 0;
+  padding: 10px;
+  overflow: auto;
+}
+
+.allure-report-item {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  margin: 0;
+  padding: 10px 11px;
+  color: var(--text);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: none;
+  text-align: left;
+  transform: none;
+}
+
+.allure-report-item:hover,
+.allure-report-item.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12);
+  transform: none;
+}
+
+.allure-report-item-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.allure-report-item-head strong,
+.allure-report-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.allure-report-meta,
+.allure-report-path {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.report-kind {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: #0369a1;
+  background: #e0f2fe;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.report-kind.snapshot {
+  color: #047857;
+  background: #d1fae5;
+}
+
+.allure-report-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.allure-report-empty {
+  padding: 24px 12px;
+  color: var(--muted);
+  text-align: center;
+  font-size: 13px;
+}
+
+.report-preview-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#allureReportFrame {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  height: auto;
+  margin: 0;
+}
+
 @keyframes viewIn {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
@@ -1656,10 +1803,6 @@ button.danger-lite:hover {
   display: none;
 }
 
-#executeAllurePanel .preview-frame {
-  display: block;
-}
-
 #executeLogPanel .log-output {
   display: block;
   background: #111827;
@@ -1745,6 +1888,19 @@ button.danger-lite:hover {
 
   .content {
     overflow: visible;
+  }
+
+  #viewReports.active {
+    height: auto;
+    min-height: 70vh;
+  }
+
+  .reports-layout {
+    grid-template-columns: 1fr;
+  }
+
+  #allureReportFrame {
+    min-height: 560px;
   }
 
   .stats-grid,

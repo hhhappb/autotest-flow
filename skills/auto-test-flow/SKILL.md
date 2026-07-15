@@ -1,11 +1,13 @@
 ---
 name: auto-test-flow
-description: End-to-end QA automation workflow for turning raw testing requirements and local materials into validated requirement context, structured test plans, test case tables, element-evidence discovery, and executable automated test scripts. Use this skill whenever the user mentions testing requirements, test plans, test cases, QA, automated testing, E2E tests, UI tests, API tests, Playwright, Pytest, Cypress, regression testing, CDP/F12 element evidence, selector confirmation, or asks to generate/run/fix test scripts, even if the request is short or vague.
+description: Explicit auto-test-flow platform workflow for pipeline, workbench, orchestrator, saved artifacts, or generated QA handoff outputs. Use only when the user explicitly names auto-test-flow or asks to run its pipeline/workbench/orchestrator, produce auto-test-flow artifacts, or operate the auto-test-flow platform. Do not use for ordinary test-code writing, repair, selector work, or vague testing requirements when project rules, ceshi, and karpathy-12-rules cover the task.
 ---
 
 # Auto Test Flow
 
-Use this skill as the coordinator for QA automation work. Keep the main flow short and load the referenced guides only when the current stage needs them.
+Use this skill only as the explicit coordinator for the auto-test-flow platform workflow. Keep the main flow short and load the referenced guides only when the current stage needs them.
+
+Do not use this skill as the default implementation workflow for ordinary test-code writing, repair, selector changes, or vague testing requirements. In projects that provide `AGENTS.md`, `ceshi`, and `karpathy-12-rules`, let those rules handle clarification and code implementation unless the user explicitly asks for auto-test-flow pipeline, workbench, orchestrator, or platform artifacts.
 
 ## Operating Principles
 
@@ -33,7 +35,7 @@ Read only the references needed for the current stage:
 
 ### Inline Mode
 
-Use this by default for quick progress in chat. Produce:
+Use this only after explicit auto-test-flow activation when the user wants quick chat progress without saved pipeline artifacts. Produce:
 
 1. Refined requirement.
 2. Assumptions and need-confirmation questions.

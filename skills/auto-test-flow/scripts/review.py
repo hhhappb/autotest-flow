@@ -20,11 +20,16 @@ def build_review_result(
     context_needed = automation_request.get("project_context_needed", [])
     required_environment = execution_request.get("required_environment", [])
     pre_run_checks = execution_request.get("pre_run_checks", [])
+    executable_steps = execution_request.get("executable_steps", [])
 
     if isinstance(selected_cases, str):
         selected_cases = [selected_cases]
     if isinstance(context_needed, str):
         context_needed = [context_needed]
+    if isinstance(executable_steps, dict):
+        executable_steps = [executable_steps]
+    if not isinstance(executable_steps, list):
+        executable_steps = []
 
     generated_text = json.dumps({
         "test_cases": test_cases,
@@ -73,6 +78,49 @@ def build_review_result(
             "建议优先保留核心 P0 和少量关键 P1。",
         ))
 
+    placeholder_cases = [
+        case for case in cases
+        if isinstance(case, dict) and _looks_placeholder_text(json.dumps(case, ensure_ascii=False))
+    ]
+    runnable_placeholder_cases = [
+        case for case in placeholder_cases
+        if str(case.get("priority", "")).upper() == "P0" or bool(case.get("automation_candidate"))
+    ]
+    if runnable_placeholder_cases:
+        findings.append(_finding(
+            "high",
+            "placeholder_case",
+            f"发现 {len(runnable_placeholder_cases)} 条占位或待确认用例被标记为 P0 或自动化候选。",
+            "占位用例必须降级为待确认/非自动化候选，不能进入 Codex 代码落地。",
+        ))
+    elif placeholder_cases:
+        findings.append(_finding(
+            "medium",
+            "placeholder_case",
+            f"发现 {len(placeholder_cases)} 条占位或待确认用例，当前测试流程仍不完整。",
+            "补齐真实界面、操作路径、预期结果和元素证据后，再生成最终测试流程。",
+        ))
+
+    if not executable_steps:
+        findings.append(_finding(
+            "high",
+            "test_flow_steps",
+            "执行请求缺少 executable_steps，审查人无法看到可审查的测试流程或发现/证据采集步骤。",
+            "execution_request.json 必须包含 executable_steps；信息不足时也要输出 project_discovery 和 evidence_capture 步骤。",
+        ))
+    else:
+        weak_steps = [
+            step for step in executable_steps
+            if isinstance(step, dict) and _step_is_weak_or_placeholder(step)
+        ]
+        if weak_steps:
+            findings.append(_finding(
+                "high",
+                "test_flow_steps",
+                f"发现 {len(weak_steps)} 个执行步骤缺少明确页面/操作/预期结果，或仍包含待确认占位文本。",
+                "最终测试流程必须说明打开什么界面、做什么操作、观察什么结果；信息不足时应停留在发现/证据采集步骤。",
+            ))
+
     if len(context_needed) > 8:
         findings.append(_finding(
             "medium",
@@ -105,6 +153,37 @@ def build_review_result(
             "Web UI 自动化请求未显式声明 element_evidence_required。",
             "Codex 写选择器、页面对象或 UI 流程前必须先采集或请求 CDP/F12 元素证据。",
         ))
+    elif target_type == "web_ui":
+        ui_steps_requiring_evidence = [
+            step for step in executable_steps
+            if isinstance(step, dict)
+            and str(step.get("action", "")) in {"click", "fill", "select", "assert"}
+            and str(step.get("selector_status", "")) != "confirmed"
+        ]
+        if ui_steps_requiring_evidence:
+            findings.append(_finding(
+                "high",
+                "element_evidence",
+                f"发现 {len(ui_steps_requiring_evidence)} 个 Web UI 点击/输入/选择/断言步骤尚未确认 selector 或 DOM 证据。",
+                "先采集 CDP/F12/真实 DOM 证据，再允许生成最终 UI 操作流程或修改 selector/page object。",
+            ))
+
+    readiness = project_context_discovery.get("test_flow_readiness", {})
+    flow_status = str(readiness.get("flow_status", ""))
+    if flow_status in {"blocked_pending_project_mapping", "needs_confirmation", "partial_from_existing_code"}:
+        final_business_steps = [
+            step for step in executable_steps
+            if isinstance(step, dict)
+            and str(step.get("phase", "")) not in {"project_discovery", "evidence_capture"}
+            and bool(step.get("confirmed"))
+        ]
+        if final_business_steps:
+            findings.append(_finding(
+                "high",
+                "test_flow_steps",
+                "项目发现结果仍显示测试流程未完全确认，但执行请求包含已确认的最终业务步骤。",
+                "在真实界面、已有代码映射、预期结果和元素证据确认前，不要把业务步骤标为 confirmed。",
+            ))
 
     all_safety_text = "\n".join(
         str(item) for item in pre_run_checks + required_environment
@@ -239,6 +318,8 @@ def build_review_notes_markdown(review_result: dict, test_cases: dict) -> str:
             "automation_scope": "自动化范围偏大",
             "environment_safety": "账号/环境安全",
             "assumptions": "测试假设待确认",
+            "placeholder_case": "占位用例不可落地",
+            "test_flow_steps": "测试流程不完整",
             "target_type": "目标类型不明确",
             "element_evidence": "页面元素证据不足",
             "framework_choice": "测试框架选择需确认",
@@ -303,6 +384,10 @@ def _build_confirmation_items(findings: list[dict], decision: str) -> list[str]:
             confirmation_items.append("确认生成内容符合当前项目结构和已有约束。")
         elif category == "assumptions":
             confirmation_items.append("让 Codex 先核对测试假设是否成立，再决定修改方案。")
+        elif category == "placeholder_case":
+            confirmation_items.append("补齐真实测试界面、操作步骤、预期结果后，再把用例标为 P0 或自动化候选。")
+        elif category == "test_flow_steps":
+            confirmation_items.append("确认测试流程已经说明打开什么界面、执行什么操作、观察和断言什么结果。")
 
     if decision == "blocked":
         confirmation_items.append("涉及代码修改前，Codex 仍需再次列出修改文件、修改点和验证命令，并等待确认。")
@@ -320,3 +405,30 @@ def _markdown_list(items) -> list[str]:
     if isinstance(items, str):
         return [f"- {items}"]
     return [f"- {item}" for item in items]
+
+
+def _looks_placeholder_text(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(item in lowered for item in [
+        "待补充",
+        "待确认",
+        "占位",
+        "对应页面",
+        "根据附件",
+        "验证功能正常",
+        "具体内容后补充",
+        "to be confirmed",
+        "tbd",
+    ])
+
+
+def _step_is_weak_or_placeholder(step: dict) -> bool:
+    text = json.dumps(step, ensure_ascii=False)
+    if _looks_placeholder_text(text):
+        return True
+    required = ["description", "page_or_location", "expected_result"]
+    for key in required:
+        value = str(step.get(key, "")).strip()
+        if not value:
+            return True
+    return False

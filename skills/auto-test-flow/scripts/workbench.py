@@ -70,6 +70,8 @@ class WorkbenchState:
         output_dir: Path,
         project_root: Path,
         python_executable: str,
+        test_python_executable: str,
+        explicit_test_python: str,
         codex_command: str,
         model: str = "deepseek-v4-flash",
     ) -> None:
@@ -79,6 +81,8 @@ class WorkbenchState:
         self.output_dir = output_dir.resolve()
         self.project_root = project_root.resolve()
         self.python_executable = python_executable
+        self.test_python_executable = test_python_executable
+        self.explicit_test_python = explicit_test_python
         self.codex_command = codex_command
         self.model = model
         self.jobs: dict[str, dict] = {}
@@ -671,10 +675,173 @@ def normalize_test_path(test_project_root: Path, value: str) -> str:
     return normalized
 
 
+def resolve_test_python(test_project_root: Path, explicit_python: str, fallback_python: str) -> str:
+    raw_explicit = str(explicit_python or "").strip()
+    if raw_explicit:
+        return str(Path(raw_explicit).expanduser().resolve())
+
+    for candidate in (
+        test_project_root / "venv" / "Scripts" / "python.exe",
+        test_project_root / ".venv" / "Scripts" / "python.exe",
+    ):
+        if candidate.exists():
+            return str(candidate.resolve())
+
+    return fallback_python
+
+
 def allure_report_url_for_env(env: str) -> str:
     if env == "all":
         return "/allure/allure_report_test/index.html"
     return "/allure/allure_report/index.html"
+
+
+def _allure_report_item(
+    *,
+    report_id: str,
+    title: str,
+    kind: str,
+    env: str,
+    path: Path,
+    url: str,
+    deletable: bool = False,
+    test_path: str = "",
+    test_name: str = "",
+    sequence: str = "",
+) -> dict:
+    return {
+        "id": report_id,
+        "title": title,
+        "kind": kind,
+        "env": env,
+        "test_path": test_path,
+        "test_name": test_name,
+        "sequence": sequence,
+        "created_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+        "url": url,
+        "deletable": deletable,
+    }
+
+
+def _resolve_snapshot_test_path(test_root: Path, file_token: str) -> str:
+    if not file_token:
+        return ""
+    try:
+        for path in (test_root / "project").rglob("*.py"):
+            rel = path.relative_to(test_root).as_posix()
+            if rel.replace("/", "_") == file_token:
+                return rel
+    except OSError:
+        return ""
+    return file_token.replace("_", "/")
+
+
+def _parse_snapshot_dir(test_root: Path, snapshot_dir: Path) -> dict:
+    name = snapshot_dir.name
+    match = re.match(r"^(?P<stamp>\d+)_(?P<seq>\d+)_(?P<body>.+)$", name)
+    if not match:
+        return {
+            "title": name[:80],
+            "test_path": "",
+            "test_name": "",
+            "sequence": "",
+        }
+
+    body = match.group("body")
+    parts = body.split("__")
+    file_token = parts[0] if parts else ""
+    class_name = parts[1] if len(parts) > 1 else ""
+    method_name = parts[2] if len(parts) > 2 else ""
+    test_name = ".".join(part for part in (class_name, method_name) if part)
+    test_path = _resolve_snapshot_test_path(test_root, file_token)
+    title = test_name or test_path or name[:80]
+    return {
+        "title": title,
+        "test_path": test_path,
+        "test_name": test_name,
+        "sequence": match.group("seq"),
+    }
+
+
+def list_allure_reports(state: WorkbenchState) -> list[dict]:
+    test_root = resolve_test_project_root(state.project_root)
+    report_root = (test_root / "testreport").resolve()
+    reports: list[dict] = []
+
+    current_reports = [
+        ("current:default", "当前总报告", "current", "test", report_root / "allure_report", "/allure/allure_report/index.html"),
+        ("current:test", "当前测试站报告", "current", "test", report_root / "allure_report_test", "/allure/allure_report_test/index.html"),
+        (
+            "current:production",
+            "当前正式站报告",
+            "current",
+            "production",
+            report_root / "allure_report_production",
+            "/allure/allure_report_production/index.html",
+        ),
+    ]
+    for report_id, title, kind, env, path, url in current_reports:
+        if (path / "index.html").is_file():
+            reports.append(
+                _allure_report_item(
+                    report_id=report_id,
+                    title=title,
+                    kind=kind,
+                    env=env,
+                    path=path,
+                    url=url,
+                )
+            )
+
+    snapshot_root = report_root / "report_snapshots"
+    if snapshot_root.exists():
+        for env_dir in snapshot_root.iterdir():
+            if not env_dir.is_dir():
+                continue
+            for snapshot_dir in env_dir.iterdir():
+                if not snapshot_dir.is_dir() or not (snapshot_dir / "index.html").is_file():
+                    continue
+                rel = snapshot_dir.relative_to(snapshot_root).as_posix()
+                parsed = _parse_snapshot_dir(test_root, snapshot_dir)
+                reports.append(
+                    _allure_report_item(
+                        report_id=f"snapshot:{rel}",
+                        title=parsed["title"],
+                        kind="snapshot",
+                        env=env_dir.name,
+                        path=snapshot_dir,
+                        url="/allure/report_snapshots/" + quote(rel) + "/index.html",
+                        deletable=True,
+                        test_path=parsed["test_path"],
+                        test_name=parsed["test_name"],
+                        sequence=parsed["sequence"],
+                    )
+                )
+
+    return sorted(reports, key=lambda item: item.get("created_at", ""), reverse=True)
+
+
+def delete_allure_snapshot(state: WorkbenchState, report_id: str) -> dict:
+    raw_id = str(report_id or "").strip()
+    if not raw_id.startswith("snapshot:"):
+        raise ValueError("Only snapshot reports can be deleted")
+
+    test_root = resolve_test_project_root(state.project_root)
+    snapshot_root = (test_root / "testreport" / "report_snapshots").resolve()
+    rel = PurePosixPath(unquote(raw_id.removeprefix("snapshot:")))
+    if len(rel.parts) != 2 or any(part in ("", ".", "..") for part in rel.parts):
+        raise ValueError("Invalid snapshot id")
+
+    target = (snapshot_root / Path(*rel.parts)).resolve()
+    if snapshot_root not in target.parents or target == snapshot_root:
+        raise ValueError("Snapshot path is outside report_snapshots")
+    if target.parent.parent != snapshot_root:
+        raise ValueError("Only a single snapshot directory can be deleted")
+    if not target.is_dir() or not (target / "index.html").is_file():
+        raise ValueError("Snapshot report does not exist")
+
+    shutil.rmtree(target)
+    return {"ok": True, "deleted": raw_id}
 
 
 def resolve_output_dir(state: WorkbenchState, value) -> Path:
@@ -939,14 +1106,22 @@ def _run_test_job(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         test_project_root = resolve_test_project_root(project_root)
+        test_python = resolve_test_python(
+            test_project_root,
+            state.explicit_test_python,
+            state.python_executable,
+        )
+        state.test_python_executable = test_python
         normalized_test_path = normalize_test_path(test_project_root, test_path)
         runner_py = test_project_root / "runner.py"
-        command = [state.python_executable, str(runner_py), "--env", env, normalized_test_path]
+        command = [test_python, str(runner_py), "--env", env, normalized_test_path]
         report_url = allure_report_url_for_env(env)
         state.update_job(job_id, command=command, log_file=str(log_path), test_env=env)
         state.append_log(job_id, f"$ {' '.join(command)}")
         state.append_log(job_id, f"工作区目录: {project_root}")
         state.append_log(job_id, f"测试项目目录: {test_project_root}")
+        state.append_log(job_id, f"平台 Python: {state.python_executable}")
+        state.append_log(job_id, f"测试 Python: {test_python}")
         state.append_log(job_id, f"测试路径: {normalized_test_path}")
         state.append_log(job_id, f"环境: {env}")
         state.append_log(job_id, f"完整日志: {log_path}")
@@ -1105,6 +1280,17 @@ async def api_delete_run(request: Request):
     return {"ok": True}
 
 
+@app.get("/api/allure-reports")
+async def api_allure_reports(request: Request):
+    return {"reports": list_allure_reports(_get_state(request))}
+
+
+@app.post("/api/allure-reports/delete")
+async def api_delete_allure_report(request: Request):
+    payload = await request.json()
+    return delete_allure_snapshot(_get_state(request), str(payload.get("id", "")))
+
+
 @app.post("/api/jobs/{job_id}/input")
 async def api_job_input(job_id: str, request: Request):
     payload = await request.json()
@@ -1131,6 +1317,11 @@ async def _serve_run_file(state: WorkbenchState, run_name: str, file_path: str) 
 
 @app.get("/")
 async def index(request: Request):
+    return HTMLResponse(build_index_html(_get_state(request)))
+
+
+@app.get("/reports")
+async def reports_index(request: Request):
     return HTMLResponse(build_index_html(_get_state(request)))
 
 
@@ -1194,11 +1385,18 @@ def _read_asset_text(filename: str) -> str:
 def build_index_html(state: WorkbenchState) -> str:
     """Render the workbench shell from assets/workbench.html."""
     content = _read_asset_text("workbench.html")
+    asset_version = str(
+        max(
+            (_asset_dir() / "workbench.css").stat().st_mtime_ns,
+            (_asset_dir() / "workbench.js").stat().st_mtime_ns,
+        )
+    )
     replacements = {
         "{{PORT}}": html.escape(str(state.port)),
         "{{PROJECT_ROOT}}": html.escape(str(state.project_root)),
         "{{OUTPUT_DIR}}": html.escape(str(state.output_dir)),
         "{{ORCHESTRATOR_PATH}}": html.escape(str(state.orchestrator_path)),
+        "{{ASSET_VERSION}}": html.escape(asset_version),
     }
     for token, value in replacements.items():
         content = content.replace(token, value)
@@ -1218,6 +1416,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=str(Path.cwd() / "output"), help="Pipeline output directory")
     parser.add_argument("--orchestrator", default=str(default_orchestrator), help="Path to orchestrator.py")
     parser.add_argument("--python", default=sys.executable, help="Python executable used for orchestrator.py")
+    parser.add_argument("--test-python", default="", help="Python executable used for auto-test runner.py")
     parser.add_argument("--codex-command", default=default_codex, help="codex executable, usually codex.cmd on Windows")
     parser.add_argument("--open-browser", action="store_true", help="Open the local workbench URL in the default browser")
     return parser.parse_args()
@@ -1225,13 +1424,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    project_root = Path(args.project_root)
+    test_python_executable = resolve_test_python(project_root, args.test_python, args.python)
     state = WorkbenchState(
         host=args.host,
         port=args.port,
         orchestrator_path=Path(args.orchestrator),
         output_dir=Path(args.output_dir),
-        project_root=Path(args.project_root),
+        project_root=project_root,
         python_executable=args.python,
+        test_python_executable=test_python_executable,
+        explicit_test_python=args.test_python,
         codex_command=args.codex_command,
         model=os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash"),
     )

@@ -212,6 +212,18 @@ def _find_latest_decision(run_dir: Path) -> str | None:
     return text[:6000] if len(text) > 6000 else text
 
 
+STABLE_CODEX_PROMPT_RULES = """不可省略硬约束：
+- 读取并遵守项目 AGENTS.md；如当前目录未看到，先检查父级目录。
+- 优先读取结构化产物：json/test_cases.json、json/automation_request.json、json/execution_request.json、json/input_materials.json、md/test_cases.md、md/test_plan.md、md/codex_task.md。
+- 不默认重新解析原始 .xlsx/.xls；只有结构化产物缺失、冲突，或用户明确要求核对时才说明原因并读取。
+- Windows 下不要通过 PowerShell inline command 或 python -c 传递中文店铺名、账号名、页面标题等测试数据；含中文数据优先来自 UTF-8 源码、JSON 或产物文件。
+- UI selector、page object、点击、读取、断言、流程修改前必须有 CDP/F12/真实 DOM 证据；缺证据时先输出证据采集计划，不猜 selector，不加兜底。
+- 修改保持最小可验证范围；不要削弱断言、隐藏产品问题，或为了通过测试吞掉真实失败。
+- 授权执行模式仅允许交接范围和白名单内最小修改；新增/删除文件、安装依赖、扩大范围、保存或修改店铺/测试环境数据、管理员权限命令，都需要新的确认。
+- 只读分析模式不得修改代码或运行会改变数据的命令；如需授权，列出范围、命令和停止条件。
+- 最终消息必须包含：结论、是否需要用户确认、准备修改/已修改文件、修改原因、已执行/未执行命令、剩余风险。"""
+
+
 def build_codex_prompt(
     run_dir: Path,
     project_root: Path,
@@ -226,20 +238,15 @@ def build_codex_prompt(
     if execution_mode == "authorized":
         targets = "、".join(f"`{target}`" for target in AUTHORIZED_CODE_TARGETS)
         edit_mode = (
-            "授权执行模式：用户已经在本地工作台对本轮任务给出一次性授权。"
-            "工作台已经在调用你之前执行飞跨/CDP 预检：关闭旧的 Feikua_Browser 进程，使用 --rpa 和 remote-debugging-port 启动新的主 Electron，并检查调试端口。"
-            "你可以在交接任务范围内连续读取 DOM/CDP 证据、访问交接任务明确指定的测试网站、做最小必要代码修改、运行相关验证命令，并根据失败结果做最小修复和复测；"
-            "不要因为每个小步骤都重新请求确认。"
-            f"本轮授权修改白名单仅限这些既有文件：{targets}。"
-            "如果修改仍在白名单文件和交接任务范围内，并且已有真实 DOM/CDP 证据，可以直接落最小代码并验证。"
-            "如果需要新增文件、删除文件、扩大任务范围、保存或修改店铺/测试环境数据、安装依赖、执行管理员权限命令，"
-            "或缺少真实 DOM 证据却必须改 selector/page object/testcase，则必须停止并说明需要新的确认。"
+            "授权执行模式：用户已对本轮交接任务给出一次性授权。"
+            f"可修改白名单文件（{targets}）、读取 CDP/DOM、运行验证命令、最小修复和复测。"
+            "超出白名单或交接范围、修改店铺/测试环境数据、新增/删除文件、安装依赖、管理员权限命令，必须重新确认。"
         )
     else:
         edit_mode = (
-            "只读分析模式：只能读取项目、产物和日志，输出接管分析、证据采集计划和最小修改方案；"
+            "只读分析模式：只能读取项目、产物和日志，输出接管分析、证据采集计划和最小修改方案。"
             "不要修改代码文件，不要运行会改变测试环境数据的命令。"
-            "如果需要进入修改或验证，请在最终消息中列出授权执行所需的范围、命令和停止条件。"
+            "如需进入修改或验证，在最终消息中列出授权执行所需范围、命令和停止条件。"
         )
     extra = f"\n\n用户补充指令：\n{extra_instruction}\n" if extra_instruction else ""
     continue_context = ""
@@ -247,7 +254,7 @@ def build_codex_prompt(
         continue_context = f"""
 ## 上轮执行决策（继续模式）
 
-以下是上一次 Codex 执行的决策摘要。你不需要重新分析项目结构和已完成的工作，请基于上轮结论和用户指令直接进入下一步。
+以下是上一次 Codex 执行的决策摘要。用于延续上下文；若与本轮用户指令或项目规则冲突，以本轮用户指令和项目规则为准。
 
 ```markdown
 {previous_decision}
@@ -267,6 +274,16 @@ def build_codex_prompt(
     materials_text = _build_codex_materials_text(materials)
     return f"""你现在由 auto-test-flow 本地工作台调用。
 
+## 稳定规则
+
+{STABLE_CODEX_PROMPT_RULES}
+
+## 执行模式
+
+{edit_mode}
+
+## 动态任务上下文
+
 项目根目录：
 {project_root}
 
@@ -275,29 +292,13 @@ def build_codex_prompt(
 
 输入材料：
 {materials_text}
-
-执行模式：
-{edit_mode}
 {continue_context}
 {preflight_section}
-必须遵循：
-- 读取并遵守项目 AGENTS.md。若当前目录未看到 `AGENTS.md`，先检查当前目录父级；本地工作台会优先把 Codex 工作目录提升到包含 `AGENTS.md` 的工作区根目录。
-- 优先调用或遵循 `karpathy-12-rules` skill；如果当前环境无法加载该 skill，则按其核心纪律执行：先读代码、少改、不要猜、不要过度设计、暴露假设、定义验证闭环。
-- 接管阶段优先读取已生成的结构化产物：`json/test_cases.json`、`json/automation_request.json`、`json/execution_request.json`、`json/input_materials.json`、`md/test_cases.md`、`md/test_plan.md` 和当前 `md/codex_task.md`。这些产物已经承载原始材料解析结果。
-- 不要默认回头解析原始 `.xlsx/.xls` 附件；只有结构化产物明显缺失、互相冲突，或用户明确要求核对原始附件时，才说明原因并请求读取原始附件。
-- 如果读取或解析 `.xlsx/.xls` 的命令被 sandbox/policy 拒绝，必须停止这条路径，改读结构化产物；不要反复更换 Python、tar、PowerShell、压缩包解析等命令继续尝试。
-- Windows 下不要通过 PowerShell inline command 或 `python -c` 传递中文店铺名、账号名、页面标题等测试数据；含中文的数据必须优先来自 UTF-8 源码/JSON/产物文件，必须临时传参时使用明确 UTF-8 的 JSON 文件或 base64 解码，避免 `AT-指纹` 变成 `AT-??` 后误搜店铺。
-- UI 选择器、页面对象、点击、读取、断言、流程修改前，必须有 CDP/F12/真实 DOM 证据；没有证据时不要猜选择器或加兜底逻辑。
-- 如果缺少 DOM 证据，必须先在项目和本 skill 中查找并优先复用现有 CDP/元素证据采集能力，例如 `auto-test/core/utils/electron_cdp.py`、`auto-test/core/base/base_electron_page.py`、`auto-test/conftest.py` 的 CDP fixture，以及 `autotest-flow/skills/auto-test-flow/scripts/element_evidence.py`。只有确认本地没有可用采集路径，才请求用户提供 F12 DOM。
-- 需要 DOM 证据时，不要要求用户手工抄 DOM；应先输出“证据采集计划”，说明准备打开的页面、会读取的元素、是否会登录、是否会保存配置、建议命令和环境影响。授权执行模式下，如果采集不保存或修改店铺/测试环境数据，可以直接按计划采集；只读分析模式下必须等待用户授权。
-- 用户授权采集后，优先用 CDP/Playwright 读取真实 DOM、outerHTML、checked/value/class/selected/disabled 等状态变化，再基于证据提出 selector/page object/testcase 修改计划。
-- 修改必须保持最小可验证范围，不能为了通过测试削弱断言或隐藏产品问题。
-- 授权执行模式下，工作台预检已经允许关闭/重启飞跨浏览器进程、启动带 CDP 的 Electron、连接 `9333/9222`、只读访问交接任务指定测试网站；这些操作不要再次请求确认。若要执行管理员权限、保存或修改店铺配置/测试环境数据、安装依赖、新增/删除文件或扩大范围，先说明影响并等待用户确认。
-- 分析范围优先限定在交接产物、AGENTS.md、相关测试用例、page object、selector 和最窄必要的公共辅助代码；如果扩大范围，必须说明原因。
-- 结束时只输出给用户做决策的摘要，不要复述代码库扫描过程、完整命令输出或中间推理。
-- 最终消息必须包含：结论、是否需要用户确认、准备修改/已修改文件、修改原因、已执行/未执行命令、剩余风险。
 {extra}
-下面是由 `md/codex_task.md` 压缩生成的精简交接摘要；如摘要不足，再按路径读取完整产物：
+
+## 精简交接摘要
+
+下面是由 `md/codex_task.md` 压缩生成的摘要；如摘要不足，再按路径读取完整产物：
 
 ```markdown
 {codex_task}
@@ -346,13 +347,6 @@ def _compact_codex_task_for_prompt(text: str) -> str:
             _compact_text(summary, 1600),
             "",
         ])
-    lines.extend([
-        "## 执行重点",
-        "",
-        "- 优先读取上面的 `json/` 与 `md/` 结构化产物，不要默认重新解析原始 `.xlsx/.xls`。",
-        "- 如果结构化产物缺失或互相冲突，先说明缺口，再请求是否读取原始附件。",
-        "- 不要重复展开 Karpathy、修改确认、CDP/F12 Gate；这些规则已经由工作台模板和 AGENTS.md 注入。",
-    ])
     return "\n".join(line.rstrip() for line in lines).strip()
 
 

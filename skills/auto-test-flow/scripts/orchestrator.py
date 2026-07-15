@@ -53,7 +53,6 @@ from config import (
 )
 from templates.test_plan_prompt import (
     AUTOMATION_REQUEST_JSON_SYSTEM_PROMPT,
-    CODEX_HANDOFF_REQUIREMENTS,
     EXECUTION_REQUEST_JSON_SYSTEM_PROMPT,
     EXTRACT_FIELDS_SYSTEM_PROMPT,
     INTAKE_VALIDATION_SYSTEM_PROMPT,
@@ -194,6 +193,7 @@ class TestWorkflowOrchestrator:
             "project_root": self.project_context_discovery.get("project_root"),
             "relevant_files": self.project_context_discovery.get("relevant_files", [])[:8],
             "recommended_commands": self.project_context_discovery.get("recommended_commands", []),
+            "test_flow_readiness": self.project_context_discovery.get("test_flow_readiness", {}),
         }, ensure_ascii=False, indent=2))
         return self.project_context_discovery
 
@@ -221,6 +221,7 @@ class TestWorkflowOrchestrator:
             self._build_system_prompt(TEST_CASES_JSON_SYSTEM_PROMPT, include_context=True),
             self._build_test_cases_user_prompt(),
             PLAN_TEMPERATURE, PLAN_MAX_TOKENS, "test_cases")
+        self._normalize_test_cases()
         print(f"生成用例数量: {len(self.test_cases.get('cases', []))}")
         return self.test_cases
 
@@ -241,6 +242,7 @@ class TestWorkflowOrchestrator:
             self._build_system_prompt(EXECUTION_REQUEST_JSON_SYSTEM_PROMPT, include_context=True),
             self._build_execution_request_prompt(),
             0.2, 4096, "execution_request")
+        self._normalize_execution_request()
         print(json.dumps(self.execution_request, ensure_ascii=False, indent=2)[:800])
         return self.execution_request
 
@@ -373,6 +375,8 @@ class TestWorkflowOrchestrator:
 You must obey the discovered project_root, framework_signals, relevant_files, recommended_commands, and hard_constraints.
 If a requested file/class/fixture/command conflicts with discovery, prefer discovery and add a need-confirmation item.
 Do not invent files, classes, selectors, fixtures, or execution commands that conflict with this context.
+Use project_context_discovery.test_flow_readiness to decide whether final business test steps are possible.
+If test_flow_readiness says the flow is blocked or partial, describe project discovery and evidence-capture steps before any business action.
 
 {self._json_block(self.project_context_discovery)}"""
 
@@ -441,12 +445,17 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 
 【异常场景】{self._fmt(fields.get('exception_scenarios'))}
 
+【项目发现摘要】
+{self._json_block(self.project_context_discovery.get('test_flow_readiness', {}))}
+
 要求：
 1. 项目上下文发现是文件结构、框架、已有测试逻辑和执行命令的事实来源。
 2. 测试方案必须复用已有测试结构，不能臆造与项目上下文冲突的页面对象、选择器、fixture、测试文件或命令。
 3. 如果输入材料已经明确给出测试点或测试用例，这些内容就是唯一测试范围；只做结构化整理，不额外扩写异常、边界、权限、安全或兼容性场景。
 4. 如果材料中一行只表达一个测试点，默认只对应一个用例；用户只指定其中一个功能点时，不要展开同一材料中的其他功能点。
-5. 如果需求与已有代码逻辑存在不确定点，请写入待确认问题，不要把假设写成确定预期。"""
+5. 必须根据项目发现摘要判断能否生成最终测试流程；如果真实界面、已有代码映射、预期结果或元素证据不足，明确写“当前不能生成最终测试流程”，并输出项目发现/元素证据采集流程。
+6. 如果能生成流程，必须用自然语言说明会打开什么界面、看到什么、做什么操作、保存或触发什么、再去哪里验证、最终断言什么。
+7. 如果需求与已有代码逻辑存在不确定点，请写入待确认问题，不要把假设写成确定预期。"""
 
     def _build_test_cases_user_prompt(self) -> str:
         """Build a project-aware user prompt for structured test cases."""
@@ -458,6 +467,9 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 【测试方案】
 {self.test_plan}
 
+【项目发现摘要】
+{self._json_block(self.project_context_discovery.get('test_flow_readiness', {}))}
+
 要求：
 1. 用例预期必须以项目上下文和已有代码逻辑为准。
 2. 不要因为常见直觉推翻已有测试逻辑；如果与直觉冲突，把原因写入 assumptions 或 need_confirmation。
@@ -465,7 +477,8 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 4. 如果材料中一行只表达一个测试点，默认只生成一个对应用例；除非该行本身明确包含多个场景。
 5. 不要主动新增异常、边界、权限、安全、兼容性、容错或回归场景；只有材料或用户明确要求时才生成。
 6. 如果信息缺失，写入 need_confirmation，不要通过新增用例来补全。
-7. 不要输出要求新增未知测试文件、未知页面对象、未知 fixture 的用例前置条件。"""
+7. 不要输出要求新增未知测试文件、未知页面对象、未知 fixture 的用例前置条件。
+8. 占位或依赖未确认页面/元素/预期的用例，automation_candidate 必须为 false，priority 不得为 P0。"""
 
     def _build_automation_request_prompt(self) -> str:
         """Build a project-aware automation handoff prompt."""
@@ -502,11 +515,170 @@ Do not invent files, classes, selectors, fixtures, or execution commands that co
 【自动化脚本实现请求】
 {self._json_block(self.automation_request)}
 
+【项目发现摘要】
+{self._json_block(self.project_context_discovery.get('test_flow_readiness', {}))}
+
 要求：
 1. 优先使用 project_context_discovery.recommended_commands。
 2. 不要输出通用的 pytest tests/、npm test 等命令，除非项目上下文明确支持。
 3. 如果执行前需要登录账号、浏览器进程、环境变量或测试数据，写入 pre_run_checks。
-4. 如果 automation_request.element_evidence_required 为 true，将"确认已完成 CDP/F12 元素证据采集"写入 pre_run_checks。"""
+4. 如果 automation_request.element_evidence_required 为 true，将"确认已完成 CDP/F12 元素证据采集"写入 pre_run_checks。
+5. executable_steps 必须输出。信息不足时不要编造业务点击步骤，改为输出 project_discovery 和 evidence_capture 步骤。"""
+
+    def _normalize_test_cases(self) -> None:
+        """Downgrade placeholder cases so they cannot masquerade as runnable P0 automation."""
+        cases = self.test_cases.get("cases", [])
+        if not isinstance(cases, list):
+            self.test_cases["cases"] = []
+            return
+
+        for case in cases:
+            if not isinstance(case, dict):
+                continue
+            case_text = json.dumps(case, ensure_ascii=False)
+            if self._looks_placeholder_text(case_text):
+                if str(case.get("priority", "")).upper() == "P0":
+                    case["priority"] = "待确认"
+                case["automation_candidate"] = False
+                notes = case.setdefault("preconditions", [])
+                if isinstance(notes, str):
+                    notes = [notes]
+                    case["preconditions"] = notes
+                if isinstance(notes, list):
+                    blocker = "真实测试界面、操作路径、预期结果或元素证据未确认前，此用例不能作为首批自动化落地对象。"
+                    if blocker not in notes:
+                        notes.append(blocker)
+
+    def _normalize_execution_request(self) -> None:
+        """Guarantee execution_request has reviewable executable_steps."""
+        if not isinstance(self.execution_request, dict):
+            self.execution_request = {}
+
+        pre_run_checks = self.execution_request.setdefault("pre_run_checks", [])
+        if isinstance(pre_run_checks, str):
+            pre_run_checks = [pre_run_checks]
+            self.execution_request["pre_run_checks"] = pre_run_checks
+        if self.automation_request.get("element_evidence_required"):
+            evidence_check = "确认已完成 CDP/F12 元素证据采集"
+            if isinstance(pre_run_checks, list) and not any(evidence_check in str(item) for item in pre_run_checks):
+                pre_run_checks.append(evidence_check)
+
+        steps = self.execution_request.get("executable_steps", [])
+        if isinstance(steps, dict):
+            steps = [steps]
+        if not isinstance(steps, list):
+            steps = []
+        steps = [step for step in steps if isinstance(step, dict)]
+
+        if not steps:
+            steps = self._build_fallback_executable_steps()
+        else:
+            for index, step in enumerate(steps, start=1):
+                self._normalize_executable_step(step, index)
+
+        self.execution_request["executable_steps"] = steps
+
+    def _build_fallback_executable_steps(self) -> list[dict]:
+        readiness = self.project_context_discovery.get("test_flow_readiness", {})
+        missing = readiness.get("missing_for_test_flow", [])
+        if isinstance(missing, str):
+            missing = [missing]
+        capture_targets = self.automation_request.get("cdp_capture_targets", [])
+        if isinstance(capture_targets, str):
+            capture_targets = [capture_targets]
+
+        steps = [
+            {
+                "step_id": "STEP-001",
+                "case_id": "",
+                "phase": "project_discovery",
+                "action": "other",
+                "description": "复核项目发现结果，确认本次测试点应复用哪些已有测试文件、page object、selector、fixture 和运行命令。",
+                "page_or_location": self.project_context_discovery.get("project_root") or "待确认",
+                "target_element": "not_applicable",
+                "target_url": "",
+                "evidence_source": "project_context_discovery",
+                "selector_status": "not_applicable",
+                "input_data": {},
+                "expected_result": "明确已有代码能支持的测试流程片段，以及仍缺少的业务信息。",
+                "confirmed": False,
+                "requires_confirmation": True,
+                "blocker_if_unconfirmed": "未确认已有代码映射前，不应生成最终业务测试流程或自动化修改计划。",
+            },
+            {
+                "step_id": "STEP-002",
+                "case_id": "",
+                "phase": "evidence_capture",
+                "action": "collect_evidence",
+                "description": "针对需要点击、选择、读取或断言的真实页面元素采集 CDP/F12 DOM 证据。",
+                "page_or_location": "待确认的真实测试页面、模块或弹窗",
+                "target_element": "、".join(str(item) for item in capture_targets) if capture_targets else "待确认",
+                "target_url": self._extract_target_url(self.requirement_text),
+                "evidence_source": "none",
+                "selector_status": "needs_evidence",
+                "input_data": {},
+                "expected_result": "获得最小 DOM/outerHTML、稳定属性、状态变化和最终 selector 选择理由。",
+                "confirmed": False,
+                "requires_confirmation": True,
+                "blocker_if_unconfirmed": "没有真实元素证据时，不允许编造 selector、页面对象操作或点击/读取/断言流程。",
+            },
+        ]
+
+        if missing:
+            steps.append({
+                "step_id": "STEP-003",
+                "case_id": "",
+                "phase": "setup",
+                "action": "other",
+                "description": "补齐最终测试流程缺失信息：" + "；".join(str(item) for item in missing[:6]),
+                "page_or_location": "待确认",
+                "target_element": "待确认",
+                "target_url": "",
+                "evidence_source": "user_confirmation",
+                "selector_status": "needs_evidence",
+                "input_data": {},
+                "expected_result": "缺失信息确认后，才能生成打开哪个界面、执行什么操作、断言什么结果的最终业务流程。",
+                "confirmed": False,
+                "requires_confirmation": True,
+                "blocker_if_unconfirmed": "信息不足时输出最终业务步骤会导致测试计划不可审查且容易误导自动化落地。",
+            })
+        return steps
+
+    def _normalize_executable_step(self, step: dict, index: int) -> None:
+        step.setdefault("step_id", f"STEP-{index:03d}")
+        step.setdefault("case_id", "")
+        step.setdefault("phase", "other")
+        step.setdefault("action", "other")
+        step.setdefault("description", step.get("target_element") or "待确认")
+        step.setdefault("page_or_location", "待确认")
+        step.setdefault("target_element", "待确认")
+        step.setdefault("target_url", "")
+        step.setdefault("evidence_source", "none")
+        step.setdefault("selector_status", "needs_evidence")
+        step.setdefault("input_data", {})
+        step.setdefault("expected_result", "待确认")
+        step.setdefault("confirmed", False)
+        step.setdefault("requires_confirmation", True)
+        if self._looks_placeholder_text(json.dumps(step, ensure_ascii=False)):
+            step["confirmed"] = False
+            step["requires_confirmation"] = True
+            step.setdefault("blocker_if_unconfirmed", "步骤仍包含待确认信息，不能作为最终业务测试流程。")
+
+    @staticmethod
+    def _looks_placeholder_text(text: str) -> bool:
+        lowered = (text or "").lower()
+        placeholders = [
+            "待补充",
+            "待确认",
+            "占位",
+            "对应页面",
+            "根据附件",
+            "验证功能正常",
+            "具体内容后补充",
+            "to be confirmed",
+            "tbd",
+        ]
+        return any(item in lowered for item in placeholders)
 
     def _set_skipped_codex_handoff(self) -> None:
         print("=" * 60)
@@ -692,66 +864,37 @@ Codex handoff was skipped by the review gate.
 3. 如使用了 `--full-artifacts`，可读取 `full/review_notes.md` 和 `full/review_result.json` 查看更完整审查信息。
 4. 如确认可以继续，再使用 `--review-policy ask` 或 `--review-policy full-auto` 重新运行。
 """
-
-        owner = self.codex_task.get("owner_split", {})
-        deepseek_items = "\n".join(f"- {item}" for item in owner.get("deepseek", []))
-        codex_items = "\n".join(f"- {item}" for item in owner.get("codex_gpt_55", []))
         target_url = self.codex_task.get("target_url") or "未提供"
 
         return f"""# Codex Handoff Task
 
-{CODEX_HANDOFF_REQUIREMENTS}
+遵守项目 AGENTS.md 全部规则。职责分工和元素证据门已在 `json/automation_request.json` 和 `json/execution_request.json` 中定义，Codex 端从 AGENTS.md 获取通用规则。
 
 ## 任务目标
 
-请基于本目录中的 Phase 2 产物接管自动化测试代码落地。DeepSeek 已完成测试设计和结构化分析；Codex/GPT-5.5 负责读取项目、提出修改计划、等待用户确认、修改代码、运行测试并修复脚本问题。
+基于本目录 Phase 2 产物接管自动化测试代码落地：读取项目、提出修改计划、等待用户确认、修改代码、运行测试并修复脚本问题。
 
 ## 必读产物
 
-- `md/requirement.md`
-- `md/test_plan.md`
-- `md/test_cases.md`
-- `md/report.md`
-- `json/test_cases.json`
-- `json/automation_request.json`
-- `json/execution_request.json`
-- `md/evidence.md`（如果工作台已采集页面证据）
-- `json/evidence.json`（如果工作台已采集页面证据）
-- `md/evidence_diff.md`（如果测试失败后已生成差异报告）
-- `json/input_materials.json`
-- `raw/raw_requirement.txt`
+- `md/test_plan.md`、`md/test_cases.md`、`md/report.md`
+- `json/test_cases.json`、`json/automation_request.json`、`json/execution_request.json`、`json/input_materials.json`
+- `md/evidence.md` / `json/evidence.json`（如有）
+- `md/evidence_diff.md`（如有）
+- `raw/raw_requirement.txt`（仅当结构化产物缺失或冲突时）
 
 ## 目标页面 URL
 
 {target_url}
 
-## DeepSeek 与 Codex 职责边界
-
-- DeepSeek 负责：
-{deepseek_items}
-- Codex/GPT-5.5 负责：
-{codex_items}
-
 ## 当前测试设计摘要
 
-- 结构化字段：读取 `json/input_materials.json` 和 `md/requirement.md`。
-- 测试方案：读取 `md/test_plan.md`。
-- 测试用例：读取 `json/test_cases.json` 和 `md/test_cases.md`。
-- 自动化实现请求：读取 `json/automation_request.json`。
-- 执行请求：读取 `json/execution_request.json`。
-- 页面证据：如果存在 `md/evidence.md` 或 `json/evidence.json`，先读取它们，再决定 selector/page object/testcase 修改方案。
-- 失败差异：如果存在 `md/evidence_diff.md`，只把它作为候选诊断依据，不要自动猜改代码。
-- 审查结论：读取 `md/review_notes.md` 和 `json/review_result.json`。
-- 原始需求：只在结构化产物缺失或互相冲突时，再读取 `raw/raw_requirement.txt`。
+读取上述 `json/` 与 `md/` 结构化产物获取完整信息，不要默认重新解析原始 `.xlsx/.xls` 附件。职责分工见 `json/automation_request.json` 的 `owner_split` 字段。
 
-## 下一步建议
+## 下一步
 
-1. 优先读取上述 `json/` 与 `md/` 结构化产物，不要默认重新解析原始 `.xlsx/.xls` 附件。
-2. 在目标项目中执行只读发现，复核测试框架、目录结构、页面对象、选择器、fixtures 和运行命令。
-3. 基于 `json/test_cases.json` 选择首批 P0/P1 自动化候选用例。
-4. 如果运行时存在 `full/` 目录，可读取其中的 project context 和 review 补充产物。
-5. 如涉及 Web UI，先采集或请求 CDP/F12 元素证据，并输出元素证据表。
-6. 输出代码修改计划并等待用户确认。
+1. 读取结构化产物，在目标项目中做只读发现，复核测试框架、目录结构和已有代码。
+2. 涉及 Web UI 时先采集 CDP/F12 元素证据，再制定 selector/page object 修改计划。
+3. 输出代码修改计划并等待用户确认。
 """
 
     def _build_test_plan_markdown(self) -> str:

@@ -4,6 +4,8 @@ let activePreviewUrl = "";
 let activePreviewRun = null;
 let activeExecuteRun = null;
 let activeEvidenceUrl = "";
+let activeAllureReportId = "";
+let activeAllureReportUrl = "/allure/allure_report/index.html";
 let selectedFiles = [];
 
 const $ = (id) => document.getElementById(id);
@@ -27,8 +29,23 @@ function showView(name, updateHash = true) {
   }
   $("crumbCurrent").textContent = viewTitles[target] || target;
   if (updateHash && viewTitles[target]) {
-    history.replaceState(null, "", "#" + target);
+    history.replaceState(null, "", "/#" + target);
   }
+  if (target === "reports") {
+    loadAllureReports().catch(showError);
+  }
+}
+
+function getInitialView() {
+  const hashView = location.hash.replace(/^#\/?/, "").replace(/^\/+/, "");
+  const pathView = location.pathname.replace(/^\/+/, "");
+  if (viewTitles[hashView]) {
+    return hashView;
+  }
+  if (viewTitles[pathView]) {
+    return pathView;
+  }
+  return "dashboard";
 }
 
 function setStatus(status, text) {
@@ -206,11 +223,6 @@ function setExecutePreview(url) {
   showExecuteTab("summary");
 }
 
-function setExecuteAllure(url) {
-  $("executeAllureFrame").src = url || "/allure/allure_report/index.html";
-  showExecuteTab("allure");
-}
-
 function setExecuteEvidence(url) {
   activeEvidenceUrl = url || "";
   $("executeEvidenceFrame").src = activeEvidenceUrl;
@@ -226,6 +238,106 @@ function setExecuteRun(run) {
   setExecutePreview(run.codex_summary_url || reviewUrl(run) || run.url || "");
   const label = reviewLabel(run);
   setStatus("", label ? "已选择 " + run.name + " · " + label : "已选择 " + run.name);
+}
+
+function allureKindLabel(kind) {
+  return kind === "snapshot" ? "历史快照" : "当前报告";
+}
+
+function selectAllureReport(report) {
+  if (!report || !report.url) return;
+  activeAllureReportId = report.id || "";
+  activeAllureReportUrl = report.url;
+  $("allureReportFrame").src = report.url;
+  for (const item of document.querySelectorAll(".allure-report-item")) {
+    item.classList.toggle("active", item.dataset.reportId === activeAllureReportId);
+  }
+}
+
+function renderAllureReports(reports, preferredUrl = "") {
+  const list = $("allureReportList");
+  const count = $("allureReportCount");
+  list.textContent = "";
+  count.textContent = String(reports.length);
+
+  if (!reports.length) {
+    const empty = document.createElement("div");
+    empty.className = "allure-report-empty";
+    empty.textContent = "暂无可查看的 Allure 报告";
+    list.appendChild(empty);
+    return;
+  }
+
+  const selected = reports.find((report) => preferredUrl && report.url === preferredUrl)
+    || reports.find((report) => report.id === activeAllureReportId)
+    || reports[0];
+
+  for (const report of reports) {
+    const item = document.createElement("button");
+    item.className = "allure-report-item";
+    item.type = "button";
+    item.dataset.reportId = report.id || "";
+
+    const head = document.createElement("div");
+    head.className = "allure-report-item-head";
+    const title = document.createElement("strong");
+    title.textContent = report.title || "Allure 报告";
+    const badge = document.createElement("span");
+    badge.textContent = allureKindLabel(report.kind);
+    badge.className = "report-kind " + (report.kind || "current");
+    head.appendChild(title);
+    head.appendChild(badge);
+
+    const meta = document.createElement("div");
+    meta.className = "allure-report-meta";
+    meta.textContent = `${report.env || "-"} · ${fmtTime(report.created_at || "")}`;
+
+    const path = document.createElement("div");
+    path.className = "allure-report-path";
+    path.textContent = report.test_path || report.test_name || report.id || "";
+
+    item.appendChild(head);
+    item.appendChild(meta);
+    if (path.textContent) item.appendChild(path);
+    item.addEventListener("click", () => selectAllureReport(report));
+
+    if (report.deletable) {
+      const actions = document.createElement("div");
+      actions.className = "allure-report-actions";
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "danger-lite small";
+      del.textContent = "删除";
+      del.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        if (!confirm(`确认删除历史快照：${report.title || report.id}？`)) return;
+        await deleteAllureReport(report.id);
+      });
+      actions.appendChild(del);
+      item.appendChild(actions);
+    }
+
+    list.appendChild(item);
+  }
+
+  selectAllureReport(selected);
+}
+
+async function loadAllureReports(preferredUrl = "") {
+  const response = await fetch("/api/allure-reports");
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || response.statusText);
+  renderAllureReports(data.reports || [], preferredUrl);
+}
+
+async function deleteAllureReport(reportId) {
+  await postJson("/api/allure-reports/delete", { id: reportId });
+  if (activeAllureReportId === reportId) {
+    activeAllureReportId = "";
+    activeAllureReportUrl = "/allure/allure_report/index.html";
+    $("allureReportFrame").src = activeAllureReportUrl;
+  }
+  await loadAllureReports(activeAllureReportUrl);
 }
 
 function reviewLabel(run) {
@@ -359,9 +471,7 @@ async function pollJob(jobId) {
       $("testStatusText").textContent = job.status === "success"
         ? (job.test_env === "all" ? "ALL 模式执行完成" : "测试全部通过")
         : "测试存在失败";
-      if ($("viewExecute").classList.contains("active")) {
-        setExecuteAllure(job.allure_report_url || "/allure/allure_report/index.html");
-      }
+      await loadAllureReports(job.allure_report_url || "/allure/allure_report/index.html");
     } else if (job.kind === "evidence") {
       $("evidenceStatusDot").className = "dot " + (job.status === "success" ? "success" : "failed");
       $("evidenceStatusText").textContent = job.status === "success" ? "证据采集完成" : "证据采集失败";
@@ -775,14 +885,9 @@ $("continueCodexBtn").addEventListener("click", () => continueCodex().catch(show
 $("runTestBtn").addEventListener("click", () => runTest().catch(showError));
 $("captureEvidenceBtn").addEventListener("click", () => captureEvidence().catch(showError));
 $("openEvidenceBtn").addEventListener("click", openExecuteEvidence);
-$("openAllureBtn").addEventListener("click", () => {
-  setExecuteAllure("/allure/allure_report/index.html");
-  showView("execute");
-});
 $("browseTestFileBtn").addEventListener("click", () => chooseTestFile().catch(showError));
 $("refreshReportBtn").addEventListener("click", () => {
-  const frame = $("allureReportFrame");
-  frame.src = frame.src;
+  loadAllureReports(activeAllureReportUrl).catch(showError);
 });
 $("refreshRunsBtn").addEventListener("click", () => loadRuns().catch(showError));
 $("refreshExecuteRunsBtn").addEventListener("click", () => loadRuns().catch(showError));
@@ -836,4 +941,4 @@ setFlowInputEnabled(false);
 renderExecuteDetail();
 loadSettings();
 saveSettings().then(loadRuns).catch(showError);
-showView(location.hash.replace("#", "") || "dashboard", false);
+showView(getInitialView(), false);

@@ -195,6 +195,12 @@ def collect_project_context(
         relevant_files=relevant_files,
         terms=terms,
     )
+    test_flow_readiness = build_test_flow_readiness(
+        project_root=project_root,
+        terms=terms,
+        relevant_files=relevant_files,
+        framework_signals=framework_signals,
+    )
     return {
         "status": "discovered",
         "project_root": str(project_root),
@@ -205,6 +211,7 @@ def collect_project_context(
         "hard_constraints": hard_constraints,
         "forbidden_patterns": forbidden_patterns,
         "notes": notes,
+        "test_flow_readiness": test_flow_readiness,
     }
 
 
@@ -440,6 +447,168 @@ def infer_project_constraints(
     return hard_constraints, forbidden_patterns, notes
 
 
+def build_test_flow_readiness(
+    *,
+    project_root: Path,
+    terms: list[str],
+    relevant_files: list[dict],
+    framework_signals: list[dict],
+) -> dict:
+    """Summarize what the local code already proves about test-flow generation."""
+    relevant_paths = [item.get("path", "") for item in relevant_files]
+    framework = infer_framework_summary(project_root, framework_signals)
+    fixtures = discover_pytest_fixtures(project_root / "conftest.py")
+    page_objects = discover_named_symbols(project_root / "project", "pages", r"class\s+([A-Za-z_][A-Za-z0-9_]*Page)\b")
+    selector_classes = discover_named_symbols(project_root / "project", "selectors", r"class\s+([A-Za-z_][A-Za-z0-9_]*Selectors?)\b")
+    matched_existing_tests = discover_matching_test_symbols(project_root, relevant_paths)
+    matched_existing_methods = discover_matching_methods(project_root, relevant_paths, terms)
+
+    known_flow_fragments = []
+    missing_for_test_flow = [
+        "真实业务目标和最终断言",
+        "本次是否允许修改测试环境数据或保存店铺配置",
+        "需要点击、读取或断言的新 UI 元素的 DOM/CDP/F12 证据",
+    ]
+    if "project/feikua/testcases/test_finger_print.py" in relevant_paths:
+        known_flow_fragments.extend([
+            "启动 Electron 并连接主窗口 CDP 9333",
+            "进入店铺列表并搜索目标店铺",
+            "进入编辑店铺 -> 店铺环境配置 -> 专家配置",
+            "打开店铺浏览器 CDP 9222 并访问 BrowserLeaks 页面",
+            "读取店铺浏览器实际指纹值并执行断言",
+        ])
+    if any("font" in term.lower() or "字体" in term for term in terms):
+        if "project/feikua/testcases/test_finger_print.py" in relevant_paths:
+            known_flow_fragments.append("已有 font 指纹用例雏形: test_font_fingerprint_mode")
+        missing_for_test_flow.extend([
+            "fontFlag=0/1/2 的业务含义",
+            "font 用例是复用、补强还是改写现有 test_font_fingerprint_mode",
+            "font 断言是否只校验 BrowserLeaks 输出非空，还是必须校验配置字体列表",
+        ])
+
+    flow_status = "needs_confirmation"
+    if matched_existing_tests and known_flow_fragments:
+        flow_status = "partial_from_existing_code"
+    elif not matched_existing_tests:
+        flow_status = "blocked_pending_project_mapping"
+
+    return {
+        "flow_status": flow_status,
+        "framework": framework,
+        "fixtures": fixtures,
+        "page_objects": page_objects[:20],
+        "selector_classes": selector_classes[:20],
+        "matched_existing_tests": matched_existing_tests[:12],
+        "matched_existing_methods": matched_existing_methods[:20],
+        "known_flow_fragments": known_flow_fragments,
+        "missing_for_test_flow": dedupe_keep_order(missing_for_test_flow),
+        "rule": "Only generate final business test steps when real page flow, code mapping, expected result, and element evidence are confirmed.",
+    }
+
+
+def infer_framework_summary(project_root: Path, framework_signals: list[dict]) -> str:
+    signal_paths = {item.get("path") for item in framework_signals}
+    parts = []
+    if "pytest.ini" in signal_paths or (project_root / "conftest.py").exists():
+        parts.append("pytest")
+    if file_contains(project_root / "conftest.py", "allure"):
+        parts.append("allure")
+    if file_contains(project_root / "conftest.py", "sync_playwright"):
+        parts.append("playwright")
+    if file_contains(project_root / "conftest.py", "electron"):
+        parts.append("electron/cdp")
+    return " + ".join(parts) if parts else "unknown"
+
+
+def discover_pytest_fixtures(conftest_path: Path) -> list[str]:
+    try:
+        text = conftest_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    fixtures = []
+    for match in re.finditer(r"@pytest\.fixture[\s\S]{0,120}?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+        fixtures.append(match.group(1))
+    return dedupe_keep_order(fixtures)
+
+
+def discover_named_symbols(project_root: Path, folder_name: str, pattern: str) -> list[dict]:
+    if not project_root.exists():
+        return []
+    symbols = []
+    regex = re.compile(pattern)
+    for path in iter_project_files(project_root):
+        rel = str(path.relative_to(project_root)).replace("\\", "/")
+        if f"/{folder_name}/" not in f"/{rel}" or path.suffix != ".py":
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        names = dedupe_keep_order(regex.findall(text))
+        for name in names:
+            symbols.append({"name": name, "path": rel})
+    return symbols
+
+
+def discover_matching_test_symbols(project_root: Path, relevant_paths: list[str]) -> list[dict]:
+    tests = []
+    for rel in relevant_paths:
+        if "/testcases/" not in rel or not rel.endswith(".py"):
+            continue
+        path = project_root / rel
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        classes = re.findall(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)", text, flags=re.MULTILINE)
+        functions = re.findall(r"^\s+def\s+(test_[A-Za-z0-9_]+)\s*\(", text, flags=re.MULTILINE)
+        tests.append({
+            "path": rel,
+            "classes": classes[:5],
+            "tests": functions[:12],
+        })
+    return tests
+
+
+def discover_matching_methods(project_root: Path, relevant_paths: list[str], terms: list[str]) -> list[dict]:
+    methods = []
+    term_lowers = [term.lower() for term in terms if len(term) >= 3]
+    for rel in relevant_paths:
+        if not rel.endswith(".py") or not any(part in rel for part in ["/pages/", "/selectors/", "/testcases/"]):
+            continue
+        path = project_root / rel
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        names = re.findall(r"^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", text, flags=re.MULTILINE)
+        constants = re.findall(r"^\s*([A-Z][A-Z0-9_]{2,})\s*=", text, flags=re.MULTILINE)
+        for name in [*names, *constants]:
+            lowered = name.lower()
+            if any(term in lowered for term in term_lowers):
+                methods.append({"name": name, "path": rel})
+    return methods
+
+
+def file_contains(path: Path, needle: str) -> bool:
+    try:
+        return needle.lower() in path.read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+
+
+def dedupe_keep_order(items: list) -> list:
+    seen = set()
+    result = []
+    for item in items:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True) if isinstance(item, dict) else str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
 def build_project_context_discovery_markdown(context: dict) -> str:
     context = context or {}
     lines = [
@@ -463,6 +632,20 @@ def build_project_context_discovery_markdown(context: dict) -> str:
     lines.extend(markdown_bullets(context.get("recommended_commands", [])))
     lines.extend(["", "## Hard Constraints"])
     lines.extend(markdown_bullets(context.get("hard_constraints", [])))
+    readiness = context.get("test_flow_readiness", {})
+    if readiness:
+        lines.extend([
+            "",
+            "## Test Flow Readiness",
+            "",
+            f"- Flow status: {readiness.get('flow_status', 'unknown')}",
+            f"- Framework: {readiness.get('framework', 'unknown')}",
+            "",
+            "### Known Flow Fragments",
+        ])
+        lines.extend(markdown_bullets(readiness.get("known_flow_fragments", [])))
+        lines.extend(["", "### Missing For Final Test Flow"])
+        lines.extend(markdown_bullets(readiness.get("missing_for_test_flow", [])))
     lines.extend(["", "## Key Snippets"])
     for snippet in context.get("key_snippets", []):
         lines.extend([
